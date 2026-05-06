@@ -24,7 +24,7 @@ COINALYZE = "https://api.coinalyze.net/v1"
 LOOKBACK_DAYS = 7              # how much history to keep
 INTERVAL = "5min"              # Coinalyze interval string
 INTERVAL_SEC = 5 * 60
-POLL_INTERVAL_SEC = 3600       # 1 hour
+POLL_INTERVAL_SEC = 300        # 5 minutes — matches Coinalyze's source cadence
 NUM_BUCKETS = 80               # price-level buckets in the rendered heatmap
 
 
