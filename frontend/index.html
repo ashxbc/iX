@@ -49,6 +49,32 @@
     <main style="display: none">
       <div id="price" class="pane"></div>
       <div id="cvd-pane" class="pane"></div>
+      <div id="funding-pane" class="funding-pane">
+        <div class="funding-anim" id="funding-anim" data-state="neutral">
+          <div class="anim-dot"></div>
+          <div class="anim-dot"></div>
+          <div class="anim-dot"></div>
+          <div class="anim-dot"></div>
+          <div class="anim-dot"></div>
+          <div class="anim-dot"></div>
+          <div class="anim-line"></div>
+        </div>
+        <div class="funding-stat">
+          <div class="stat-lbl">funding</div>
+          <div class="stat-val" id="fund-val">—</div>
+          <div class="stat-sub" id="fund-countdown">next in —</div>
+        </div>
+        <div class="funding-stat">
+          <div class="stat-lbl">open interest</div>
+          <div class="stat-val" id="oi-val">—</div>
+          <div class="stat-sub" id="oi-change">1h —</div>
+        </div>
+        <div class="funding-stat funding-signal" id="funding-signal">
+          <div class="stat-lbl">signal</div>
+          <div class="signal-text" id="signal-text">NEUTRAL</div>
+          <div class="stat-sub" id="signal-sub">no setup</div>
+        </div>
+      </div>
     </main>
     <script src="/static/app.js"></script>
   </body>

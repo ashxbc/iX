@@ -82,7 +82,7 @@ select {
 
 main {
   display: grid;
-  grid-template-rows: 2fr 1fr;
+  grid-template-rows: 2fr 1fr 90px;
   height: calc(100% - 41px);
 }
 
@@ -191,4 +191,190 @@ main {
   font-size: 11px;
   min-height: 14px;
   text-align: center;
+}
+
+/* ---------------- Funding / OI panel ---------------- */
+
+.funding-pane {
+  display: grid;
+  grid-template-columns: 120px 1fr 1fr 1.2fr;
+  align-items: center;
+  gap: 16px;
+  padding: 0 18px;
+  background: var(--bg-1);
+  border-top: 1px solid var(--line);
+  height: 100%;
+  overflow: hidden;
+}
+
+.funding-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.stat-lbl {
+  color: var(--mute);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+.stat-val {
+  color: var(--fg);
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.stat-sub {
+  color: var(--mute);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.funding-signal .signal-text {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.25em;
+  color: var(--mute);
+  transition: color 0.4s ease;
+}
+.funding-signal[data-state="squeeze"] .signal-text { color: var(--up); }
+.funding-signal[data-state="flush"]   .signal-text { color: var(--down); }
+
+/* ----- Animation widget ----- */
+
+.funding-anim {
+  position: relative;
+  width: 100%;
+  height: 70px;
+  border: 1px solid var(--line);
+  background: #0c0c0c;
+  overflow: hidden;
+  border-radius: 2px;
+}
+
+.funding-anim .anim-dot {
+  position: absolute;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #888;
+  opacity: 0;
+}
+
+.funding-anim .anim-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, #444, transparent);
+  opacity: 0.5;
+}
+
+/* Position the 6 dots horizontally so the per-dot delays produce a wave */
+.funding-anim .anim-dot:nth-child(1) { left: 12%; }
+.funding-anim .anim-dot:nth-child(2) { left: 26%; }
+.funding-anim .anim-dot:nth-child(3) { left: 40%; }
+.funding-anim .anim-dot:nth-child(4) { left: 54%; }
+.funding-anim .anim-dot:nth-child(5) { left: 68%; }
+.funding-anim .anim-dot:nth-child(6) { left: 84%; }
+
+/* NEUTRAL — calm horizontal drift, soft pulse on the EKG line */
+.funding-anim[data-state="neutral"] .anim-dot {
+  background: #9aa0a6;
+  animation: drift 4s ease-in-out infinite;
+}
+.funding-anim[data-state="neutral"] .anim-dot:nth-child(1) { animation-delay: 0s; }
+.funding-anim[data-state="neutral"] .anim-dot:nth-child(2) { animation-delay: -0.5s; }
+.funding-anim[data-state="neutral"] .anim-dot:nth-child(3) { animation-delay: -1s; }
+.funding-anim[data-state="neutral"] .anim-dot:nth-child(4) { animation-delay: -1.5s; }
+.funding-anim[data-state="neutral"] .anim-dot:nth-child(5) { animation-delay: -2s; }
+.funding-anim[data-state="neutral"] .anim-dot:nth-child(6) { animation-delay: -2.5s; }
+.funding-anim[data-state="neutral"] .anim-line {
+  background: linear-gradient(90deg, transparent, #555, transparent);
+  animation: pulse-line 3s ease-in-out infinite;
+}
+
+@keyframes drift {
+  0%, 100% { transform: translateY(28px); opacity: 0.35; }
+  50%      { transform: translateY(36px); opacity: 0.8; }
+}
+@keyframes pulse-line {
+  0%, 100% { opacity: 0.25; }
+  50%      { opacity: 0.6; }
+}
+
+/* SQUEEZE — pressure building upward, green glow */
+.funding-anim[data-state="squeeze"] {
+  border-color: rgba(38, 166, 154, 0.45);
+  background: radial-gradient(ellipse at center bottom, rgba(38,166,154,0.08), #0c0c0c 70%);
+}
+.funding-anim[data-state="squeeze"] .anim-dot {
+  background: var(--up);
+  box-shadow: 0 0 6px rgba(38, 166, 154, 0.7);
+  animation: rise 1.6s ease-in infinite;
+}
+.funding-anim[data-state="squeeze"] .anim-dot:nth-child(1) { animation-delay: 0s; }
+.funding-anim[data-state="squeeze"] .anim-dot:nth-child(2) { animation-delay: -0.25s; }
+.funding-anim[data-state="squeeze"] .anim-dot:nth-child(3) { animation-delay: -0.5s; }
+.funding-anim[data-state="squeeze"] .anim-dot:nth-child(4) { animation-delay: -0.75s; }
+.funding-anim[data-state="squeeze"] .anim-dot:nth-child(5) { animation-delay: -1s; }
+.funding-anim[data-state="squeeze"] .anim-dot:nth-child(6) { animation-delay: -1.25s; }
+.funding-anim[data-state="squeeze"] .anim-line {
+  background: linear-gradient(90deg, transparent, var(--up), transparent);
+  top: 6px;
+  height: 2px;
+  opacity: 0.7;
+  animation: glow-top 1.6s ease-in-out infinite;
+}
+
+@keyframes rise {
+  0%   { transform: translateY(60px) scale(0.6); opacity: 0; }
+  20%  { opacity: 1; }
+  80%  { opacity: 1; }
+  100% { transform: translateY(0px)  scale(1.1); opacity: 0; }
+}
+@keyframes glow-top {
+  0%, 100% { opacity: 0.4; box-shadow: 0 0 0 rgba(38,166,154,0); }
+  50%      { opacity: 0.9; box-shadow: 0 0 12px rgba(38,166,154,0.7); }
+}
+
+/* FLUSH — weight collapsing downward, red glow */
+.funding-anim[data-state="flush"] {
+  border-color: rgba(239, 83, 80, 0.45);
+  background: radial-gradient(ellipse at center top, rgba(239,83,80,0.08), #0c0c0c 70%);
+}
+.funding-anim[data-state="flush"] .anim-dot {
+  background: var(--down);
+  box-shadow: 0 0 6px rgba(239, 83, 80, 0.7);
+  width: 6px;
+  height: 6px;
+  animation: fall 1.6s ease-in infinite;
+}
+.funding-anim[data-state="flush"] .anim-dot:nth-child(1) { animation-delay: 0s; }
+.funding-anim[data-state="flush"] .anim-dot:nth-child(2) { animation-delay: -0.25s; }
+.funding-anim[data-state="flush"] .anim-dot:nth-child(3) { animation-delay: -0.5s; }
+.funding-anim[data-state="flush"] .anim-dot:nth-child(4) { animation-delay: -0.75s; }
+.funding-anim[data-state="flush"] .anim-dot:nth-child(5) { animation-delay: -1s; }
+.funding-anim[data-state="flush"] .anim-dot:nth-child(6) { animation-delay: -1.25s; }
+.funding-anim[data-state="flush"] .anim-line {
+  background: linear-gradient(90deg, transparent, var(--down), transparent);
+  top: auto;
+  bottom: 6px;
+  height: 2px;
+  opacity: 0.7;
+  animation: glow-bot 1.6s ease-in-out infinite;
+}
+
+@keyframes fall {
+  0%   { transform: translateY(0px) scale(0.6); opacity: 0; }
+  20%  { opacity: 1; }
+  80%  { opacity: 1; }
+  100% { transform: translateY(60px) scale(1.1); opacity: 0; }
+}
+@keyframes glow-bot {
+  0%, 100% { opacity: 0.4; box-shadow: 0 0 0 rgba(239,83,80,0); }
+  50%      { opacity: 0.9; box-shadow: 0 0 12px rgba(239,83,80,0.7); }
 }

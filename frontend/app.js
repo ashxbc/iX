@@ -72,7 +72,91 @@ async function ensureAuth() {
 function logout() {
   localStorage.removeItem("ix_token");
   if (state.ws) { state.ws.onclose = null; state.ws.close(); }
+  if (state.fundingWs) { state.fundingWs.onclose = null; state.fundingWs.close(); }
   location.reload();
+}
+
+/* ---------- Funding / OI panel ---------- */
+
+function fmtFunding(rate) {
+  if (rate === null || rate === undefined || Number.isNaN(rate)) return "—";
+  // Funding rate comes as a fraction (e.g. -0.0001 = -0.01%). Show as %.
+  const pct = rate * 100;
+  const sign = pct >= 0 ? "+" : "";
+  return `${sign}${pct.toFixed(4)}%`;
+}
+
+function fmtOI(usd) {
+  if (!usd) return "—";
+  if (usd >= 1e9) return `$${(usd / 1e9).toFixed(2)}B`;
+  if (usd >= 1e6) return `$${(usd / 1e6).toFixed(1)}M`;
+  return `$${Math.round(usd).toLocaleString()}`;
+}
+
+function fmtCountdown(nextTs) {
+  if (!nextTs) return "next in —";
+  const diff = nextTs - Date.now();
+  if (diff <= 0) return "settling…";
+  const h = Math.floor(diff / 3_600_000);
+  const m = Math.floor((diff % 3_600_000) / 60_000);
+  return `next in ${h}h ${m.toString().padStart(2, "0")}m`;
+}
+
+function applyFunding(c) {
+  if (!c) return;
+  state.lastFunding = c;
+  const fundEl = $("fund-val");
+  fundEl.textContent = fmtFunding(c.funding_rate);
+  fundEl.style.color =
+    c.funding_rate > 0 ? "var(--up)" :
+    c.funding_rate < 0 ? "var(--down)" : "var(--fg)";
+
+  $("fund-countdown").textContent = fmtCountdown(c.next_funding_time);
+
+  $("oi-val").textContent = fmtOI(c.oi_value);
+  const chg = c.oi_change_1h || 0;
+  const chgPct = (chg * 100).toFixed(2);
+  const oiSub = $("oi-change");
+  oiSub.textContent = `1h ${chg >= 0 ? "+" : ""}${chgPct}%`;
+  oiSub.style.color = chg > 0 ? "var(--up)" : chg < 0 ? "var(--down)" : "var(--mute)";
+
+  const sig = c.signal || "neutral";
+  const anim = $("funding-anim");
+  const sigBox = $("funding-signal");
+  anim.dataset.state = sig;
+  sigBox.dataset.state = sig;
+  $("signal-text").textContent = sig.toUpperCase();
+  $("signal-sub").textContent =
+    sig === "squeeze" ? "shorts trapped — bullish" :
+    sig === "flush"   ? "longs trapped — bearish" :
+                        "no setup";
+}
+
+let fundingCountdownTimer = null;
+
+function connectFunding() {
+  if (state.fundingWs) {
+    state.fundingWs.onclose = null;
+    state.fundingWs.close();
+  }
+  const url = `${WS_PROTO}://${BACKEND}/ws/funding?token=${encodeURIComponent(state.token)}`;
+  const ws = new WebSocket(url);
+  state.fundingWs = ws;
+  ws.onmessage = (m) => {
+    const msg = JSON.parse(m.data);
+    if (msg.event === "snapshot") applyFunding(msg.data.current);
+    else if (msg.event === "tick") applyFunding(msg.data);
+  };
+  ws.onclose = () => setTimeout(connectFunding, 2000);
+
+  // Refresh the countdown text once a minute (the rate itself updates every 30s via WS).
+  if (fundingCountdownTimer) clearInterval(fundingCountdownTimer);
+  fundingCountdownTimer = setInterval(() => {
+    const txt = $("fund-countdown").textContent;
+    if (!txt.startsWith("next in")) return;
+    // we don't have the timestamp here; re-apply via cached state
+    if (state.lastFunding) $("fund-countdown").textContent = fmtCountdown(state.lastFunding.next_funding_time);
+  }, 30_000);
 }
 
 const chartOpts = {
@@ -236,6 +320,7 @@ async function init() {
   });
 
   connect();
+  connectFunding();
 }
 
 init();

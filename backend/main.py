@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 
 from cvd_engine import CVDEngine, TIMEFRAME_MS
 from divergence import detect_divergences
+from funding_engine import FundingOIEngine
 from storage import Store
 
 
@@ -57,7 +58,7 @@ async def lifespan(app: FastAPI):
     app.state.engines: dict[tuple[str, str], CVDEngine] = {}
     app.state.tasks: dict[tuple[str, str], asyncio.Task] = {}
 
-    print(f"[boot] starting {len(SYMBOLS) * len(TIMEFRAMES)} engines (24/7)")
+    print(f"[boot] starting {len(SYMBOLS) * len(TIMEFRAMES)} CVD engines (24/7)")
     for sym in SYMBOLS:
         for tf in TIMEFRAMES:
             eng = CVDEngine(sym, tf, store)
@@ -65,6 +66,14 @@ async def lifespan(app: FastAPI):
             key = (sym.lower(), tf)
             app.state.engines[key] = eng
             app.state.tasks[key] = asyncio.create_task(eng.run())
+
+    # Funding/OI engine (BTC only for now)
+    print("[boot] starting funding/OI engine (BTCUSDT)")
+    fund_eng = FundingOIEngine("BTCUSDT", store)
+    await fund_eng.seed_history()
+    app.state.funding = fund_eng
+    app.state.funding_task = asyncio.create_task(fund_eng.run())
+
     print("[boot] all engines running")
 
     try:
@@ -72,8 +81,13 @@ async def lifespan(app: FastAPI):
     finally:
         for t in app.state.tasks.values():
             t.cancel()
-        await asyncio.gather(*app.state.tasks.values(), return_exceptions=True)
-        # Final flush of any in-progress live candles
+        if hasattr(app.state, "funding_task"):
+            app.state.funding_task.cancel()
+        await asyncio.gather(
+            *app.state.tasks.values(),
+            getattr(app.state, "funding_task", asyncio.sleep(0)),
+            return_exceptions=True,
+        )
         for eng in app.state.engines.values():
             if eng.candles and eng.candles[-1].observed:
                 store.upsert(eng.symbol.upper(), eng.timeframe, eng.candles[-1].to_dict())
@@ -116,6 +130,39 @@ async def status():
             "last": last,
         })
     return {"engines": out}
+
+
+@app.get("/api/funding", dependencies=[Depends(require_auth)])
+async def funding_status():
+    eng: FundingOIEngine = app.state.funding
+    return eng.snapshot_history()
+
+
+@app.websocket("/ws/funding")
+async def funding_feed(ws: WebSocket, token: str | None = Query(default=None)):
+    if not _check_token(token):
+        await ws.close(code=4401)
+        return
+    await ws.accept()
+    eng: FundingOIEngine = app.state.funding
+    queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+
+    async def listener(event: str, payload: dict):
+        try:
+            queue.put_nowait({"event": event, "data": payload})
+        except asyncio.QueueFull:
+            pass
+
+    eng.on_update(listener)
+    try:
+        await ws.send_text(json.dumps({"event": "snapshot", "data": eng.snapshot_history()}))
+        while True:
+            msg = await queue.get()
+            await ws.send_text(json.dumps(msg))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        eng.off_update(listener)
 
 
 @app.websocket("/ws/{symbol}/{timeframe}")

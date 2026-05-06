@@ -28,6 +28,23 @@ CREATE TABLE IF NOT EXISTS candles (
     PRIMARY KEY (symbol, timeframe, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_candles_st ON candles(symbol, timeframe, ts DESC);
+
+CREATE TABLE IF NOT EXISTS funding (
+    symbol TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    rate REAL NOT NULL,
+    PRIMARY KEY (symbol, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_funding_s ON funding(symbol, ts DESC);
+
+CREATE TABLE IF NOT EXISTS open_interest (
+    symbol TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    oi REAL NOT NULL,
+    oi_value REAL NOT NULL,
+    PRIMARY KEY (symbol, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_oi_s ON open_interest(symbol, ts DESC);
 """
 
 
@@ -80,6 +97,42 @@ class Store:
                 (delta, symbol, timeframe, after_ts),
             )
             self._conn.commit()
+
+    def upsert_funding(self, symbol: str, ts: int, rate: float):
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO funding (symbol, ts, rate) VALUES (?,?,?)
+                ON CONFLICT(symbol, ts) DO UPDATE SET rate=excluded.rate""",
+                (symbol, ts, rate),
+            )
+            self._conn.commit()
+
+    def upsert_oi(self, symbol: str, ts: int, oi: float, oi_value: float):
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO open_interest (symbol, ts, oi, oi_value) VALUES (?,?,?,?)
+                ON CONFLICT(symbol, ts) DO UPDATE SET oi=excluded.oi, oi_value=excluded.oi_value""",
+                (symbol, ts, oi, oi_value),
+            )
+            self._conn.commit()
+
+    def load_funding(self, symbol: str, limit: int = 500) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ts, rate FROM funding WHERE symbol=? ORDER BY ts DESC LIMIT ?",
+                (symbol, limit),
+            ).fetchall()
+        rows.reverse()
+        return [{"ts": r[0], "rate": r[1]} for r in rows]
+
+    def load_oi(self, symbol: str, limit: int = 500) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ts, oi, oi_value FROM open_interest WHERE symbol=? ORDER BY ts DESC LIMIT ?",
+                (symbol, limit),
+            ).fetchall()
+        rows.reverse()
+        return [{"ts": r[0], "oi": r[1], "oi_value": r[2]} for r in rows]
 
     def last_ts(self, symbol: str, timeframe: str) -> int | None:
         with self._lock:
