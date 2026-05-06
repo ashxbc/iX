@@ -23,6 +23,8 @@ async function verifyToken(token) {
   try {
     const r = await fetch(`${HTTP}://${BACKEND}/api/auth/check`, {
       headers: { "X-Auth-Token": token },
+      cache: "no-store",
+      credentials: "omit",
     });
     return r.ok;
   } catch {
@@ -36,7 +38,12 @@ function showError(msg) {
 
 async function ensureAuth() {
   let token = localStorage.getItem("ix_token") || "";
-  if (token && await verifyToken(token)) return token;
+  if (token) {
+    if (await verifyToken(token)) return token;
+    // Stored token failed verification — drop it so we don't keep retrying
+    // a broken value across refreshes.
+    localStorage.removeItem("ix_token");
+  }
 
   return new Promise((resolve) => {
     const overlay = $("auth-overlay");
@@ -203,6 +210,8 @@ async function init() {
   buildCharts();
   const r = await fetch(`${HTTP}://${BACKEND}/api/symbols`, {
     headers: { "X-Auth-Token": state.token },
+    cache: "no-store",
+    credentials: "omit",
   }).then((x) => x.json());
   const sel = $("symbol");
   r.symbols.forEach((s) => {
