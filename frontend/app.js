@@ -186,7 +186,15 @@ function buildCharts() {
     wickUpColor: "#26a69a", wickDownColor: "#ef5350",
   });
 
-  // Basis histogram lives in the CVD pane — same time axis, separate overlay
+  state.cvdChart = LightweightCharts.createChart($("cvd-pane"), {
+    ...chartOpts,
+    timeScale: { ...chartOpts.timeScale, visible: false },
+  });
+  state.cvdSeries = state.cvdChart.addLineSeries({
+    color: "#d4d4d4", lineWidth: 2, priceLineVisible: false,
+  });
+
+  // Basis histogram in the CVD pane — same time axis, separate overlay
   // scale anchored to the bottom 28% so it never crowds the CVD line.
   state.basisSeries = state.cvdChart.addHistogramSeries({
     priceScaleId: "basis",
@@ -199,17 +207,9 @@ function buildCharts() {
     scaleMargins: { top: 0.75, bottom: 0 },
     visible: false,
   });
-  // Keep the CVD line in the top 75% so it never overlaps the basis bars.
+  // Keep CVD line in the top 75% so it never overlaps the basis bars.
   state.cvdChart.priceScale("right").applyOptions({
     scaleMargins: { top: 0.05, bottom: 0.28 },
-  });
-
-  state.cvdChart = LightweightCharts.createChart($("cvd-pane"), {
-    ...chartOpts,
-    timeScale: { ...chartOpts.timeScale, visible: false },
-  });
-  state.cvdSeries = state.cvdChart.addLineSeries({
-    color: "#d4d4d4", lineWidth: 2, priceLineVisible: false,
   });
 
   // Sync time scales between panes — guarded to prevent feedback loop.
