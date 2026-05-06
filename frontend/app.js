@@ -75,6 +75,7 @@ function logout() {
   if (state.fundingWs) { state.fundingWs.onclose = null; state.fundingWs.close(); }
   if (state.liqWs) { state.liqWs.onclose = null; state.liqWs.close(); }
   if (state.basisWs) { state.basisWs.onclose = null; state.basisWs.close(); }
+  if (state.liveLiqWs) { state.liveLiqWs.onclose = null; state.liveLiqWs.close(); }
   location.reload();
 }
 
@@ -406,6 +407,71 @@ function connectBasis() {
   ws.onclose = () => setTimeout(connectBasis, 2000);
 }
 
+/* ---------- Live liquidation flash labels ---------- */
+
+function showLiqFlash(ev) {
+  if (!state.candleSeries) return;
+  const pane = $("price");
+  const y = state.candleSeries.priceToCoordinate(ev.price);
+  if (y == null || isNaN(y)) return;
+
+  const w = pane.clientWidth;
+  const h = pane.clientHeight;
+
+  const el = document.createElement("div");
+  el.className = "liq-flash " + (ev.side === "long" ? "long" : "short");
+  const arrow = ev.side === "long" ? "▼" : "▲";
+  const lbl = ev.side === "long" ? "LONG REKT" : "SHORT REKT";
+  el.textContent = `${arrow} ${fmtUsd(ev.usd)} ${lbl}`;
+  pane.appendChild(el);
+
+  // Place near right edge but not over the price scale; offset on overlap
+  const dpr = state.lastPrice && ev.price > state.lastPrice ? -22 : 12;
+  let top = Math.round(y + dpr);
+  // De-overlap with recent labels at similar Y
+  const near = (state._liqFlashes || []).filter(f => Math.abs(f.top - top) < 22);
+  if (near.length) top += near.length * 22 * (ev.side === "long" ? 1 : -1);
+  // Clamp inside pane
+  if (top < 4) top = 4;
+  if (top > h - 24) top = h - 24;
+
+  const lw = el.offsetWidth || 140;
+  let left = w - lw - 14;
+  if (left < 8) left = 8;
+  el.style.left = left + "px";
+  el.style.top = top + "px";
+
+  state._liqFlashes = state._liqFlashes || [];
+  const entry = { el, top, until: Date.now() + 2400 };
+  state._liqFlashes.push(entry);
+
+  setTimeout(() => {
+    el.remove();
+    state._liqFlashes = state._liqFlashes.filter(f => f !== entry);
+  }, 2500);
+}
+
+function connectLiveLiq() {
+  if (state.liveLiqWs) {
+    state.liveLiqWs.onclose = null;
+    state.liveLiqWs.close();
+  }
+  const url = `${WS_PROTO}://${BACKEND}/ws/live-liq?token=${encodeURIComponent(state.token)}`;
+  const ws = new WebSocket(url);
+  state.liveLiqWs = ws;
+  ws.onmessage = (m) => {
+    try {
+      const msg = JSON.parse(m.data);
+      if (msg.event === "liq") showLiqFlash(msg.data);
+    } catch {}
+  };
+  ws.onclose = () => {
+    state.liveLiqWs = null;
+    setTimeout(connectLiveLiq, 3000);
+  };
+  ws.onerror = () => {};
+}
+
 /* ---------- Liquidation heatmap ---------- */
 
 function ensureLiqCanvas() {
@@ -664,6 +730,7 @@ async function init() {
   connect();
   connectFunding();
   connectBasis();
+  connectLiveLiq();
   if (state.liqVisible) connectLiquidations();
 }
 

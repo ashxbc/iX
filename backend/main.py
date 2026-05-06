@@ -21,6 +21,7 @@ from cvd_engine import CVDEngine, TIMEFRAME_MS
 from divergence import detect_divergences
 from funding_engine import FundingOIEngine
 from liquidation_engine import LiquidationEngine
+from live_liq_engine import LiveLiquidationEngine
 from storage import Store
 
 
@@ -85,6 +86,12 @@ async def lifespan(app: FastAPI):
     app.state.basis = basis_eng
     app.state.basis_task = asyncio.create_task(basis_eng.run())
 
+    # Live liquidation feed (Binance Futures forceOrder WS, BTC only)
+    print("[boot] starting live liquidation feed (BTCUSDT)")
+    live_liq = LiveLiquidationEngine("BTCUSDT")
+    app.state.live_liq = live_liq
+    app.state.live_liq_task = asyncio.create_task(live_liq.run())
+
     # Liquidation heatmap engine (BTC only)
     app.state.liquidation = None
     app.state.liquidation_task = None
@@ -103,7 +110,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         extra_tasks = []
-        for attr in ("funding_task", "basis_task", "liquidation_task"):
+        for attr in ("funding_task", "basis_task", "liquidation_task", "live_liq_task"):
             t = getattr(app.state, attr, None)
             if t is not None:
                 t.cancel()
@@ -189,6 +196,32 @@ async def basis_feed(ws: WebSocket, token: str | None = Query(default=None)):
     eng.on_update(listener)
     try:
         await ws.send_text(json.dumps({"event": "snapshot", "data": eng.snapshot_history()}))
+        while True:
+            msg = await queue.get()
+            await ws.send_text(json.dumps(msg))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        eng.off_update(listener)
+
+
+@app.websocket("/ws/live-liq")
+async def live_liq_feed(ws: WebSocket, token: str | None = Query(default=None)):
+    if not _check_token(token):
+        await ws.close(code=4401)
+        return
+    eng: LiveLiquidationEngine = app.state.live_liq
+    await ws.accept()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+
+    async def listener(event: str, payload: dict):
+        try:
+            queue.put_nowait({"event": event, "data": payload})
+        except asyncio.QueueFull:
+            pass
+
+    eng.on_update(listener)
+    try:
         while True:
             msg = await queue.get()
             await ws.send_text(json.dumps(msg))

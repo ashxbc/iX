@@ -183,6 +183,41 @@ main {
   display: none;
 }
 .liq-tooltip.show { display: block; }
+
+/* ---------------- Live liquidation flash labels ---------------- */
+.liq-flash {
+  position: absolute;
+  pointer-events: none;
+  font-size: 11px;
+  font-weight: 700;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  padding: 3px 7px;
+  border-radius: 2px;
+  z-index: 8;
+  animation: liq-fade 2.4s ease-out forwards;
+  text-shadow: 0 0 4px currentColor;
+}
+.liq-flash.long  {
+  color: var(--down);
+  background: rgba(239, 83, 80, 0.14);
+  border: 1px solid rgba(239, 83, 80, 0.45);
+  box-shadow: 0 0 8px rgba(239, 83, 80, 0.25);
+}
+.liq-flash.short {
+  color: var(--up);
+  background: rgba(38, 166, 154, 0.14);
+  border: 1px solid rgba(38, 166, 154, 0.45);
+  box-shadow: 0 0 8px rgba(38, 166, 154, 0.25);
+}
+
+@keyframes liq-fade {
+  0%   { opacity: 0; transform: translateX(-12px) scale(0.92); }
+  10%  { opacity: 1; transform: translateX(0) scale(1); }
+  60%  { opacity: 1; transform: translateX(0) scale(1); }
+  100% { opacity: 0; transform: translateX(14px) scale(0.96); }
+}
 .liq-tooltip .row { display: flex; gap: 10px; justify-content: space-between; }
 .liq-tooltip .lbl { color: var(--mute); }
 .liq-tooltip .long { color: var(--up); }
