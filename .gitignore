@@ -1,0 +1,28 @@
+# env / secrets
+.env
+.env.local
+.env.*.local
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# data
+backend/data.db
+backend/data.db-*
+backend/backups/
+
+# os / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# node (if you ever add a build step)
+node_modules/
+.next/
+.vercel/

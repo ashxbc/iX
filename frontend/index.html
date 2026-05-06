@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>iX</title>
+  <!--
+    When deploying the frontend separately (e.g. on Vercel), set this meta tag
+    to the public host of your backend, without protocol:
+        <meta name="ix-backend" content="ix.yourdomain.com" />
+    When the frontend is served by FastAPI itself, leave it empty/omitted.
+  -->
+  <meta name="ix-backend" content="" />
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <div id="auth-overlay" class="auth-overlay">
+    <form id="auth-form" class="auth-form" autocomplete="off">
+      <div class="auth-brand">iX</div>
+      <input id="auth-input" type="password" placeholder="access token" autocomplete="off" spellcheck="false" />
+      <button type="submit">enter</button>
+      <div id="auth-error" class="auth-error"></div>
+    </form>
+  </div>
+
+  <header style="display:none">
+    <div class="brand">iX</div>
+    <div class="controls">
+      <select id="symbol"></select>
+      <div class="tfs" id="tfs"></div>
+      <div class="status" id="status">disconnected</div>
+    </div>
+    <div class="readout">
+      <span class="lbl">price</span><span id="px">—</span>
+      <span class="lbl">cvd</span><span id="cvd">—</span>
+      <span class="lbl">delta</span><span id="delta">—</span>
+      <button id="logout" class="logout" title="clear access token">logout</button>
+    </div>
+  </header>
+  <main style="display:none">
+    <div id="price" class="pane"></div>
+    <div id="cvd-pane" class="pane"></div>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

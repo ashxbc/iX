@@ -1,0 +1,23 @@
+[Unit]
+Description=iX trading terminal (CVD engine)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ix
+Group=ix
+WorkingDirectory=/opt/iX/backend
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/iX/backend/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=3
+# Drop privileges + tighten the sandbox
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/iX/backend
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
