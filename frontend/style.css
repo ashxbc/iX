@@ -246,10 +246,10 @@ main {
 
 .funding-pane {
   display: grid;
-  grid-template-columns: 120px 1fr 1fr 1.2fr;
+  grid-template-columns: 110px 1fr 1fr 1fr 1.1fr;
   align-items: center;
-  gap: 16px;
-  padding: 0 18px;
+  gap: 14px;
+  padding: 0 16px;
   background: var(--bg-1);
   border-top: 1px solid var(--line);
   height: 100%;

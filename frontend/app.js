@@ -74,6 +74,7 @@ function logout() {
   if (state.ws) { state.ws.onclose = null; state.ws.close(); }
   if (state.fundingWs) { state.fundingWs.onclose = null; state.fundingWs.close(); }
   if (state.liqWs) { state.liqWs.onclose = null; state.liqWs.close(); }
+  if (state.basisWs) { state.basisWs.onclose = null; state.basisWs.close(); }
   location.reload();
 }
 
@@ -183,6 +184,21 @@ function buildCharts() {
     upColor: "#26a69a", downColor: "#ef5350",
     borderUpColor: "#26a69a", borderDownColor: "#ef5350",
     wickUpColor: "#26a69a", wickDownColor: "#ef5350",
+  });
+
+  // Basis histogram on a separate left scale, anchored to the bottom 22% of
+  // the price pane so it never collides with candles or the heatmap bars.
+  state.basisSeries = state.priceChart.addHistogramSeries({
+    priceScaleId: "basis",
+    priceFormat: { type: "price", precision: 2, minMove: 0.01 },
+    base: 0,
+    lastValueVisible: false,
+    priceLineVisible: false,
+  });
+  state.priceChart.priceScale("basis").applyOptions({
+    scaleMargins: { top: 0.78, bottom: 0 },
+    borderColor: "#1c1c1c",
+    visible: false,
   });
 
   state.cvdChart = LightweightCharts.createChart($("cvd-pane"), {
@@ -296,6 +312,95 @@ function connect() {
     else if (msg.event === "tick" || msg.event === "candle") applyTick(msg.data);
     else if (msg.event === "divergences") applyDivergences(msg.data);
   };
+}
+
+/* ---------- Spot vs Perp basis ---------- */
+
+function fmtBasisUsd(v) {
+  if (v === null || v === undefined || Number.isNaN(v)) return "—";
+  const sign = v >= 0 ? "+" : "−";
+  const abs = Math.abs(v);
+  return `${sign}$${abs.toFixed(2)}`;
+}
+
+function fmtBasisPct(v) {
+  if (v === null || v === undefined || Number.isNaN(v)) return "—";
+  const sign = v >= 0 ? "+" : "−";
+  return `${sign}${Math.abs(v).toFixed(4)}%`;
+}
+
+function applyBasis(c) {
+  if (!c) return;
+  state.lastBasis = c;
+  const valEl = $("basis-val");
+  valEl.textContent = `${fmtBasisUsd(c.basis)} (${fmtBasisPct(c.basis_pct)})`;
+  valEl.style.color =
+    c.basis > 0 ? "var(--up)" :
+    c.basis < 0 ? "var(--down)" : "var(--fg)";
+  const sub = $("basis-sub");
+  const leader =
+    c.state === "spot_led" ? "spot leading — real demand" :
+    c.state === "perp_led" ? "perp leading — leverage driven" :
+                              "balanced";
+  sub.textContent = leader;
+  sub.style.color =
+    c.state === "spot_led" ? "var(--up)" :
+    c.state === "perp_led" ? "var(--down)" : "var(--mute)";
+}
+
+function setBasisSeriesData(history) {
+  if (!state.basisSeries || !history) return;
+  // Histogram data sorted by time, colored by sign. Use basis_pct so the
+  // overlay scales sensibly across different price regimes.
+  const seen = new Set();
+  const data = [];
+  for (const p of history) {
+    const t = Math.floor(p.ts);
+    if (seen.has(t)) continue; // dedupe identical timestamps
+    seen.add(t);
+    data.push({
+      time: t,
+      value: p.basis_pct,
+      color: p.basis_pct >= 0
+        ? "rgba(38, 166, 154, 0.55)"
+        : "rgba(239, 83, 80, 0.55)",
+    });
+  }
+  data.sort((a, b) => a.time - b.time);
+  state.basisSeries.setData(data);
+}
+
+function pushBasisSample(sample) {
+  if (!state.basisSeries || !sample) return;
+  state.basisSeries.update({
+    time: Math.floor(sample.ts),
+    value: sample.basis_pct,
+    color: sample.basis_pct >= 0
+      ? "rgba(38, 166, 154, 0.55)"
+      : "rgba(239, 83, 80, 0.55)",
+  });
+}
+
+function connectBasis() {
+  if (state.basisWs) {
+    state.basisWs.onclose = null;
+    state.basisWs.close();
+  }
+  const url = `${WS_PROTO}://${BACKEND}/ws/basis?token=${encodeURIComponent(state.token)}`;
+  const ws = new WebSocket(url);
+  state.basisWs = ws;
+  ws.onmessage = (m) => {
+    const msg = JSON.parse(m.data);
+    if (msg.event === "snapshot") {
+      applyBasis(msg.data.current);
+      setBasisSeriesData(msg.data.history || []);
+    } else if (msg.event === "tick") {
+      applyBasis(msg.data);
+    } else if (msg.event === "sample") {
+      pushBasisSample(msg.data);
+    }
+  };
+  ws.onclose = () => setTimeout(connectBasis, 2000);
 }
 
 /* ---------- Liquidation heatmap ---------- */
@@ -555,6 +660,7 @@ async function init() {
 
   connect();
   connectFunding();
+  connectBasis();
   if (state.liqVisible) connectLiquidations();
 }
 

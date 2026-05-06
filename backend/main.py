@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from basis_engine import BasisEngine
 from cvd_engine import CVDEngine, TIMEFRAME_MS
 from divergence import detect_divergences
 from funding_engine import FundingOIEngine
@@ -77,6 +78,13 @@ async def lifespan(app: FastAPI):
     app.state.funding = fund_eng
     app.state.funding_task = asyncio.create_task(fund_eng.run())
 
+    # Basis engine (Spot vs Perp premium, BTC only)
+    print("[boot] starting basis engine (BTCUSDT)")
+    basis_eng = BasisEngine("BTCUSDT", store)
+    await basis_eng.seed_history()
+    app.state.basis = basis_eng
+    app.state.basis_task = asyncio.create_task(basis_eng.run())
+
     # Liquidation heatmap engine (BTC only)
     app.state.liquidation = None
     app.state.liquidation_task = None
@@ -94,16 +102,17 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        extra_tasks = []
+        for attr in ("funding_task", "basis_task", "liquidation_task"):
+            t = getattr(app.state, attr, None)
+            if t is not None:
+                t.cancel()
+                extra_tasks.append(t)
         for t in app.state.tasks.values():
             t.cancel()
-        if hasattr(app.state, "funding_task"):
-            app.state.funding_task.cancel()
-        if getattr(app.state, "liquidation_task", None):
-            app.state.liquidation_task.cancel()
         await asyncio.gather(
             *app.state.tasks.values(),
-            getattr(app.state, "funding_task", asyncio.sleep(0)),
-            getattr(app.state, "liquidation_task", None) or asyncio.sleep(0),
+            *extra_tasks,
             return_exceptions=True,
         )
         for eng in app.state.engines.values():
@@ -154,6 +163,39 @@ async def status():
 async def funding_status():
     eng: FundingOIEngine = app.state.funding
     return eng.snapshot_history()
+
+
+@app.get("/api/basis", dependencies=[Depends(require_auth)])
+async def basis_status():
+    eng: BasisEngine = app.state.basis
+    return eng.snapshot_history()
+
+
+@app.websocket("/ws/basis")
+async def basis_feed(ws: WebSocket, token: str | None = Query(default=None)):
+    if not _check_token(token):
+        await ws.close(code=4401)
+        return
+    eng: BasisEngine = app.state.basis
+    await ws.accept()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=400)
+
+    async def listener(event: str, payload: dict):
+        try:
+            queue.put_nowait({"event": event, "data": payload})
+        except asyncio.QueueFull:
+            pass
+
+    eng.on_update(listener)
+    try:
+        await ws.send_text(json.dumps({"event": "snapshot", "data": eng.snapshot_history()}))
+        while True:
+            msg = await queue.get()
+            await ws.send_text(json.dumps(msg))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        eng.off_update(listener)
 
 
 @app.get("/api/liquidations", dependencies=[Depends(require_auth)])

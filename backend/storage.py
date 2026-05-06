@@ -56,6 +56,17 @@ CREATE TABLE IF NOT EXISTS liquidations (
     PRIMARY KEY (symbol, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_liq_s ON liquidations(symbol, ts DESC);
+
+CREATE TABLE IF NOT EXISTS basis (
+    symbol TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    spot REAL NOT NULL,
+    perp REAL NOT NULL,
+    basis REAL NOT NULL,
+    basis_pct REAL NOT NULL,
+    PRIMARY KEY (symbol, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_basis_s ON basis(symbol, ts DESC);
 """
 
 
@@ -173,6 +184,37 @@ class Store:
         rows.reverse()
         return [
             {"ts": r[0], "long_usd": r[1], "short_usd": r[2], "low": r[3], "high": r[4]}
+            for r in rows
+        ]
+
+    def upsert_basis(self, symbol: str, ts: int, spot: float, perp: float, basis: float, basis_pct: float):
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO basis (symbol, ts, spot, perp, basis, basis_pct) VALUES (?,?,?,?,?,?)
+                ON CONFLICT(symbol, ts) DO UPDATE SET
+                    spot=excluded.spot, perp=excluded.perp,
+                    basis=excluded.basis, basis_pct=excluded.basis_pct""",
+                (symbol, ts, spot, perp, basis, basis_pct),
+            )
+            self._conn.commit()
+
+    def load_basis(self, symbol: str, since_ts: int | None = None, limit: int = 5000) -> list[dict]:
+        with self._lock:
+            if since_ts is None:
+                rows = self._conn.execute(
+                    """SELECT ts, spot, perp, basis, basis_pct FROM basis
+                    WHERE symbol=? ORDER BY ts DESC LIMIT ?""",
+                    (symbol, limit),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """SELECT ts, spot, perp, basis, basis_pct FROM basis
+                    WHERE symbol=? AND ts >= ? ORDER BY ts DESC LIMIT ?""",
+                    (symbol, since_ts, limit),
+                ).fetchall()
+        rows.reverse()
+        return [
+            {"ts": r[0], "spot": r[1], "perp": r[2], "basis": r[3], "basis_pct": r[4]}
             for r in rows
         ]
 
