@@ -308,8 +308,76 @@ function ensureLiqCanvas() {
   if (!state.liqVisible) c.classList.add("hidden");
   pane.appendChild(c);
   state.liqCanvas = c;
+
+  const tip = document.createElement("div");
+  tip.className = "liq-tooltip";
+  pane.appendChild(tip);
+  state.liqTooltip = tip;
+
+  pane.addEventListener("mousemove", onLiqHover);
+  pane.addEventListener("mouseleave", hideLiqTooltip);
+
   resizeLiqCanvas();
   return c;
+}
+
+function fmtUsd(v) {
+  if (!v) return "$0";
+  if (v >= 1e9) return `$${(v / 1e9).toFixed(2)}B`;
+  if (v >= 1e6) return `$${(v / 1e6).toFixed(2)}M`;
+  if (v >= 1e3) return `$${(v / 1e3).toFixed(1)}K`;
+  return `$${Math.round(v).toLocaleString()}`;
+}
+
+function hideLiqTooltip() {
+  if (state.liqTooltip) state.liqTooltip.classList.remove("show");
+}
+
+function onLiqHover(e) {
+  const tip = state.liqTooltip;
+  if (!tip) return;
+  if (!state.liqVisible || !state.liqHeatmap || !state.candleSeries) return hideLiqTooltip();
+  const data = state.liqHeatmap;
+  if (!data.buckets || data.buckets.length === 0) return hideLiqTooltip();
+
+  const pane = $("price");
+  const rect = pane.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+
+  const price = state.candleSeries.coordinateToPrice(y);
+  if (price == null || isNaN(price)) return hideLiqTooltip();
+
+  const bs = data.bucket_size;
+  // Closest bucket whose [price - bs/2, price + bs/2] contains hovered price
+  let bucket = null;
+  let bestDist = Infinity;
+  for (const b of data.buckets) {
+    const d = Math.abs(b.price - price);
+    if (d <= bs / 2 && d < bestDist) { bestDist = d; bucket = b; }
+  }
+  if (!bucket) return hideLiqTooltip();
+
+  const total = bucket.long_usd + bucket.short_usd;
+  const priceLo = bucket.price - bs / 2;
+  const priceHi = bucket.price + bs / 2;
+  tip.innerHTML = `
+    <div class="row"><span class="lbl">level</span><span>${fmt(priceLo, 0)} – ${fmt(priceHi, 0)}</span></div>
+    <div class="row"><span class="lbl">longs</span><span class="long">${fmtUsd(bucket.long_usd)}</span></div>
+    <div class="row"><span class="lbl">shorts</span><span class="short">${fmtUsd(bucket.short_usd)}</span></div>
+    <div class="row"><span class="lbl">total</span><span>${fmtUsd(total)}</span></div>
+  `;
+  tip.classList.add("show");
+
+  // Position near cursor, clamped to pane
+  let lx = x + 14, ly = y + 14;
+  const lw = tip.offsetWidth, lh = tip.offsetHeight;
+  if (lx + lw > rect.width - 4) lx = x - lw - 14;
+  if (ly + lh > rect.height - 4) ly = y - lh - 14;
+  if (lx < 4) lx = 4;
+  if (ly < 4) ly = 4;
+  tip.style.left = lx + "px";
+  tip.style.top = ly + "px";
 }
 
 function resizeLiqCanvas() {
@@ -420,6 +488,7 @@ function setLiqVisible(on) {
   if (btn) btn.setAttribute("aria-pressed", on ? "true" : "false");
   const c = state.liqCanvas;
   if (c) c.classList.toggle("hidden", !on);
+  if (!on) hideLiqTooltip();
   if (on) {
     if (!state.liqWs) connectLiquidations();
     drawHeatmap();

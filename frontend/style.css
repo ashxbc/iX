@@ -169,6 +169,25 @@ main {
 }
 .liq-canvas.hidden { display: none; }
 
+.liq-tooltip {
+  position: absolute;
+  pointer-events: none;
+  z-index: 12;
+  background: #111;
+  border: 1px solid #333;
+  padding: 6px 9px;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: nowrap;
+  color: var(--fg);
+  display: none;
+}
+.liq-tooltip.show { display: block; }
+.liq-tooltip .row { display: flex; gap: 10px; justify-content: space-between; }
+.liq-tooltip .lbl { color: var(--mute); }
+.liq-tooltip .long { color: var(--up); }
+.liq-tooltip .short { color: var(--down); }
+
 .auth-overlay {
   position: fixed;
   inset: 0;

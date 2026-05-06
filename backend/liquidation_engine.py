@@ -254,17 +254,19 @@ class LiquidationEngine:
         now = int(time.time())
         last = self.store.last_liquidation_ts(self.symbol) or (now - LOOKBACK_DAYS * 86400)
         from_ts = max(last + INTERVAL_SEC, now - LOOKBACK_DAYS * 86400)
-        if from_ts >= now:
-            return
-        async with httpx.AsyncClient(timeout=30) as c:
-            merged = await self._fetch_window(c, from_ts, now)
-        for row in merged:
-            self.store.upsert_liquidation(
-                self.symbol, row["ts"], row["long_usd"], row["short_usd"],
-                row["low"], row["high"],
-            )
-        if merged:
-            print(f"[liq] +{len(merged)} new intervals")
+        if from_ts < now:
+            async with httpx.AsyncClient(timeout=30) as c:
+                merged = await self._fetch_window(c, from_ts, now)
+            for row in merged:
+                self.store.upsert_liquidation(
+                    self.symbol, row["ts"], row["long_usd"], row["short_usd"],
+                    row["low"], row["high"],
+                )
+            if merged:
+                print(f"[liq] +{len(merged)} new intervals")
+        # Always rebuild + emit, even when no new intervals came in. This way
+        # the 7-day sliding window expires old buckets on every tick instead
+        # of only when fresh liquidations land.
         self._last_update_ms = int(time.time() * 1000)
         self._heatmap = self._build_heatmap()
         await self._emit("snapshot", self._heatmap)
