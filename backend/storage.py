@@ -45,6 +45,17 @@ CREATE TABLE IF NOT EXISTS open_interest (
     PRIMARY KEY (symbol, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_oi_s ON open_interest(symbol, ts DESC);
+
+CREATE TABLE IF NOT EXISTS liquidations (
+    symbol TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    long_usd REAL NOT NULL,
+    short_usd REAL NOT NULL,
+    low REAL NOT NULL,
+    high REAL NOT NULL,
+    PRIMARY KEY (symbol, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_liq_s ON liquidations(symbol, ts DESC);
 """
 
 
@@ -133,6 +144,44 @@ class Store:
             ).fetchall()
         rows.reverse()
         return [{"ts": r[0], "oi": r[1], "oi_value": r[2]} for r in rows]
+
+    def upsert_liquidation(self, symbol: str, ts: int, long_usd: float, short_usd: float, low: float, high: float):
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO liquidations (symbol, ts, long_usd, short_usd, low, high) VALUES (?,?,?,?,?,?)
+                ON CONFLICT(symbol, ts) DO UPDATE SET
+                    long_usd=excluded.long_usd, short_usd=excluded.short_usd,
+                    low=excluded.low, high=excluded.high""",
+                (symbol, ts, long_usd, short_usd, low, high),
+            )
+            self._conn.commit()
+
+    def load_liquidations(self, symbol: str, since_ts: int | None = None, limit: int = 5000) -> list[dict]:
+        with self._lock:
+            if since_ts is None:
+                rows = self._conn.execute(
+                    """SELECT ts, long_usd, short_usd, low, high FROM liquidations
+                    WHERE symbol=? ORDER BY ts DESC LIMIT ?""",
+                    (symbol, limit),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """SELECT ts, long_usd, short_usd, low, high FROM liquidations
+                    WHERE symbol=? AND ts >= ? ORDER BY ts DESC LIMIT ?""",
+                    (symbol, since_ts, limit),
+                ).fetchall()
+        rows.reverse()
+        return [
+            {"ts": r[0], "long_usd": r[1], "short_usd": r[2], "low": r[3], "high": r[4]}
+            for r in rows
+        ]
+
+    def last_liquidation_ts(self, symbol: str) -> int | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(ts) FROM liquidations WHERE symbol=?", (symbol,)
+            ).fetchone()
+        return row[0] if row and row[0] is not None else None
 
     def last_ts(self, symbol: str, timeframe: str) -> int | None:
         with self._lock:

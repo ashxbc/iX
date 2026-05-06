@@ -73,6 +73,7 @@ function logout() {
   localStorage.removeItem("ix_token");
   if (state.ws) { state.ws.onclose = null; state.ws.close(); }
   if (state.fundingWs) { state.fundingWs.onclose = null; state.fundingWs.close(); }
+  if (state.liqWs) { state.liqWs.onclose = null; state.liqWs.close(); }
   location.reload();
 }
 
@@ -205,9 +206,18 @@ function buildCharts() {
   const onResize = () => {
     state.priceChart.applyOptions({ width: $("price").clientWidth, height: $("price").clientHeight });
     state.cvdChart.applyOptions({ width: $("cvd-pane").clientWidth, height: $("cvd-pane").clientHeight });
+    resizeLiqCanvas();
+    drawHeatmap();
   };
+  ensureLiqCanvas();
   onResize();
   window.addEventListener("resize", onResize);
+
+  // Repaint the heatmap whenever the price chart's visible price range changes
+  // (zoom, pan, autoscale). Lightweight Charts doesn't expose a single event
+  // for price-range changes, so we hook the time scale + a rAF loop guard.
+  state.priceChart.timeScale().subscribeVisibleTimeRangeChange(() => drawHeatmap());
+  state.candleSeries.subscribeDataChanged?.(() => drawHeatmap());
 }
 
 function setStatus(s, cls) {
@@ -222,6 +232,7 @@ function fmt(n, d = 2) {
 }
 
 function applySnapshot(candles, divergences) {
+  if (candles.length) state.lastPrice = candles[candles.length - 1].close;
   const cs = candles.map((c) => ({
     time: Math.floor(c.ts / 1000),
     open: c.open, high: c.high, low: c.low, close: c.close,
@@ -255,6 +266,7 @@ function applyTick(c) {
   // Keep CVD time index aligned with price: emit whitespace when not observed,
   // a real value once a trade has been seen.
   state.cvdSeries.update(c.observed ? { time: t, value: c.cvd } : { time: t });
+  state.lastPrice = c.close;
   $("px").textContent = fmt(c.close);
   $("cvd").textContent = fmt(c.cvd, 0);
   const d = c.delta;
@@ -286,12 +298,165 @@ function connect() {
   };
 }
 
+/* ---------- Liquidation heatmap ---------- */
+
+function ensureLiqCanvas() {
+  if (state.liqCanvas) return state.liqCanvas;
+  const pane = $("price");
+  const c = document.createElement("canvas");
+  c.className = "liq-canvas";
+  if (!state.liqVisible) c.classList.add("hidden");
+  pane.appendChild(c);
+  state.liqCanvas = c;
+  resizeLiqCanvas();
+  return c;
+}
+
+function resizeLiqCanvas() {
+  const c = state.liqCanvas;
+  if (!c) return;
+  const pane = $("price");
+  const w = pane.clientWidth;
+  const h = pane.clientHeight;
+  const dpr = window.devicePixelRatio || 1;
+  c.width = Math.floor(w * dpr);
+  c.height = Math.floor(h * dpr);
+  c.style.width = w + "px";
+  c.style.height = h + "px";
+  const ctx = c.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+let _heatmapRafPending = false;
+function drawHeatmap() {
+  if (_heatmapRafPending) return;
+  _heatmapRafPending = true;
+  requestAnimationFrame(() => {
+    _heatmapRafPending = false;
+    _drawHeatmap();
+  });
+}
+
+function _drawHeatmap() {
+  const c = state.liqCanvas;
+  if (!c || !state.liqVisible) return;
+  const ctx = c.getContext("2d");
+  const w = c.clientWidth;
+  const h = c.clientHeight;
+  ctx.clearRect(0, 0, w, h);
+
+  const data = state.liqHeatmap;
+  if (!data || !data.buckets || data.buckets.length === 0 || !data.max_usd) return;
+  if (!state.candleSeries) return;
+
+  const bucketSize = data.bucket_size;
+  const maxBarPx = Math.max(40, Math.floor(w * 0.32));
+  const lastClose = state.lastPrice ?? null;
+
+  // Pre-compute coordinates and skip buckets outside the visible price range.
+  const visibleTop = state.candleSeries.coordinateToPrice(0);
+  const visibleBot = state.candleSeries.coordinateToPrice(h);
+  const pMin = Math.min(visibleTop ?? Infinity, visibleBot ?? Infinity);
+  const pMax = Math.max(visibleTop ?? -Infinity, visibleBot ?? -Infinity);
+
+  for (const b of data.buckets) {
+    if (b.price + bucketSize / 2 < pMin || b.price - bucketSize / 2 > pMax) continue;
+
+    const yTop = state.candleSeries.coordinateToPrice ? state.candleSeries.priceToCoordinate?.(b.price + bucketSize / 2) : null;
+    const yBot = state.candleSeries.priceToCoordinate?.(b.price - bucketSize / 2);
+    const yCenter = state.candleSeries.priceToCoordinate?.(b.price);
+    if (yCenter == null || isNaN(yCenter)) continue;
+
+    let barH = (yBot != null && yTop != null && !isNaN(yTop) && !isNaN(yBot))
+      ? Math.max(1, Math.abs(yBot - yTop) - 1)
+      : 2;
+    barH = Math.min(barH, 30);
+
+    const total = b.long_usd + b.short_usd;
+    const intensity = total / data.max_usd;          // 0..1
+    const barW = Math.max(2, Math.floor(intensity * maxBarPx));
+
+    // Color by side dominance, with current price as the divider hint.
+    // Long liquidations are most relevant below price (teal).
+    // Short liquidations are most relevant above price (red).
+    const longDominant = b.long_usd >= b.short_usd;
+    const baseColor = longDominant ? [38, 166, 154] : [239, 83, 80];
+    const alpha = 0.18 + intensity * 0.55;           // 0.18..0.73
+
+    const x = w - barW - 2;
+    const y = Math.round(yCenter - barH / 2);
+
+    ctx.fillStyle = `rgba(${baseColor[0]}, ${baseColor[1]}, ${baseColor[2]}, ${alpha})`;
+    ctx.fillRect(x, y, barW, barH);
+
+    // Thin minority sliver in the opposite color, if both sides present
+    const minority = longDominant ? b.short_usd : b.long_usd;
+    if (minority > 0 && total > 0) {
+      const minColor = longDominant ? [239, 83, 80] : [38, 166, 154];
+      const minW = Math.max(1, Math.floor((minority / total) * barW));
+      ctx.fillStyle = `rgba(${minColor[0]}, ${minColor[1]}, ${minColor[2]}, ${alpha})`;
+      ctx.fillRect(x, y, minW, barH);
+    }
+
+    // Bright leading edge for the bar (so cluster magnitude reads instantly)
+    ctx.fillStyle = `rgba(${baseColor[0]}, ${baseColor[1]}, ${baseColor[2]}, ${Math.min(1, alpha + 0.25)})`;
+    ctx.fillRect(x, y, 1, barH);
+  }
+
+  // Optional: dim cue line at the data window's right edge
+  if (lastClose != null) {
+    const ly = state.candleSeries.priceToCoordinate?.(lastClose);
+    if (ly != null && !isNaN(ly)) {
+      ctx.strokeStyle = "rgba(255,255,255,0.04)";
+      ctx.beginPath(); ctx.moveTo(0, ly); ctx.lineTo(w, ly); ctx.stroke();
+    }
+  }
+}
+
+function setLiqVisible(on) {
+  state.liqVisible = !!on;
+  localStorage.setItem("ix_liq_on", on ? "1" : "0");
+  const btn = $("liq-toggle");
+  if (btn) btn.setAttribute("aria-pressed", on ? "true" : "false");
+  const c = state.liqCanvas;
+  if (c) c.classList.toggle("hidden", !on);
+  if (on) {
+    if (!state.liqWs) connectLiquidations();
+    drawHeatmap();
+  }
+}
+
+function connectLiquidations() {
+  if (state.liqWs) {
+    state.liqWs.onclose = null;
+    state.liqWs.close();
+  }
+  const url = `${WS_PROTO}://${BACKEND}/ws/liquidations?token=${encodeURIComponent(state.token)}`;
+  const ws = new WebSocket(url);
+  state.liqWs = ws;
+  ws.onmessage = (m) => {
+    const msg = JSON.parse(m.data);
+    if (msg.event === "snapshot") {
+      state.liqHeatmap = msg.data;
+      drawHeatmap();
+    }
+  };
+  ws.onclose = () => {
+    state.liqWs = null;
+    if (state.liqVisible) setTimeout(connectLiquidations, 5000);
+  };
+  ws.onerror = () => {};
+}
+
 async function init() {
   state.token = await ensureAuth();
   document.querySelector("header").style.display = "";
   document.querySelector("main").style.display = "";
   $("logout").onclick = logout;
+  state.liqVisible = localStorage.getItem("ix_liq_on") === "1";
   buildCharts();
+  $("liq-toggle").setAttribute("aria-pressed", state.liqVisible ? "true" : "false");
+  $("liq-toggle").onclick = () => setLiqVisible(!state.liqVisible);
   const r = await fetch(`${HTTP}://${BACKEND}/api/symbols`, {
     headers: { "X-Auth-Token": state.token },
     cache: "no-store",
@@ -321,6 +486,7 @@ async function init() {
 
   connect();
   connectFunding();
+  if (state.liqVisible) connectLiquidations();
 }
 
 init();

@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from cvd_engine import CVDEngine, TIMEFRAME_MS
 from divergence import detect_divergences
 from funding_engine import FundingOIEngine
+from liquidation_engine import LiquidationEngine
 from storage import Store
 
 
@@ -29,6 +30,8 @@ if not ACCESS_TOKEN or len(ACCESS_TOKEN) < 24:
         "IX_ACCESS_TOKEN must be set in backend/.env and be at least 24 chars long. "
         "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(18))\""
     )
+
+COINALYZE_API_KEY = os.environ.get("COINALYZE_API_KEY", "").strip()
 
 
 def _check_token(candidate: str | None) -> bool:
@@ -47,7 +50,7 @@ async def require_auth(
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+SYMBOLS = ["BTCUSDT"]
 TIMEFRAMES = list(TIMEFRAME_MS.keys())
 
 
@@ -74,6 +77,18 @@ async def lifespan(app: FastAPI):
     app.state.funding = fund_eng
     app.state.funding_task = asyncio.create_task(fund_eng.run())
 
+    # Liquidation heatmap engine (BTC only)
+    app.state.liquidation = None
+    app.state.liquidation_task = None
+    if COINALYZE_API_KEY:
+        print("[boot] starting liquidation engine (BTCUSDT)")
+        liq_eng = LiquidationEngine("BTCUSDT", "BTCUSDT_PERP.A", COINALYZE_API_KEY, store)
+        await liq_eng.seed_history()
+        app.state.liquidation = liq_eng
+        app.state.liquidation_task = asyncio.create_task(liq_eng.run())
+    else:
+        print("[boot] COINALYZE_API_KEY not set — skipping liquidation engine")
+
     print("[boot] all engines running")
 
     try:
@@ -83,9 +98,12 @@ async def lifespan(app: FastAPI):
             t.cancel()
         if hasattr(app.state, "funding_task"):
             app.state.funding_task.cancel()
+        if getattr(app.state, "liquidation_task", None):
+            app.state.liquidation_task.cancel()
         await asyncio.gather(
             *app.state.tasks.values(),
             getattr(app.state, "funding_task", asyncio.sleep(0)),
+            getattr(app.state, "liquidation_task", None) or asyncio.sleep(0),
             return_exceptions=True,
         )
         for eng in app.state.engines.values():
@@ -136,6 +154,44 @@ async def status():
 async def funding_status():
     eng: FundingOIEngine = app.state.funding
     return eng.snapshot_history()
+
+
+@app.get("/api/liquidations", dependencies=[Depends(require_auth)])
+async def liquidations_status():
+    eng: LiquidationEngine | None = app.state.liquidation
+    if eng is None:
+        return {"enabled": False, "snapshot": None}
+    return {"enabled": True, "snapshot": eng.snapshot()}
+
+
+@app.websocket("/ws/liquidations")
+async def liquidations_feed(ws: WebSocket, token: str | None = Query(default=None)):
+    if not _check_token(token):
+        await ws.close(code=4401)
+        return
+    eng: LiquidationEngine | None = app.state.liquidation
+    if eng is None:
+        await ws.close(code=4404)
+        return
+    await ws.accept()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+
+    async def listener(event: str, payload: dict):
+        try:
+            queue.put_nowait({"event": event, "data": payload})
+        except asyncio.QueueFull:
+            pass
+
+    eng.on_update(listener)
+    try:
+        await ws.send_text(json.dumps({"event": "snapshot", "data": eng.snapshot()}))
+        while True:
+            msg = await queue.get()
+            await ws.send_text(json.dumps(msg))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        eng.off_update(listener)
 
 
 @app.websocket("/ws/funding")

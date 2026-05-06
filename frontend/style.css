@@ -139,6 +139,36 @@ main {
 }
 .logout:hover { color: var(--fg); }
 
+.icon-btn {
+  background: var(--bg);
+  color: var(--mute);
+  border: 1px solid var(--line);
+  padding: 4px 8px;
+  font-family: inherit;
+  cursor: pointer;
+  margin-left: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+}
+.icon-btn svg { fill: currentColor; }
+.icon-btn:hover { color: var(--fg); }
+.icon-btn[aria-pressed="true"] {
+  color: var(--up);
+  border-color: rgba(38, 166, 154, 0.5);
+}
+
+/* ---------------- Liquidation heatmap overlay ---------------- */
+#price { overflow: hidden; }
+.liq-canvas {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 4;
+}
+.liq-canvas.hidden { display: none; }
+
 .auth-overlay {
   position: fixed;
   inset: 0;
