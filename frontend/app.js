@@ -186,19 +186,22 @@ function buildCharts() {
     wickUpColor: "#26a69a", wickDownColor: "#ef5350",
   });
 
-  // Basis histogram on a separate left scale, anchored to the bottom 22% of
-  // the price pane so it never collides with candles or the heatmap bars.
-  state.basisSeries = state.priceChart.addHistogramSeries({
+  // Basis histogram lives in the CVD pane — same time axis, separate overlay
+  // scale anchored to the bottom 28% so it never crowds the CVD line.
+  state.basisSeries = state.cvdChart.addHistogramSeries({
     priceScaleId: "basis",
-    priceFormat: { type: "price", precision: 2, minMove: 0.01 },
+    priceFormat: { type: "price", precision: 4, minMove: 0.0001 },
     base: 0,
     lastValueVisible: false,
     priceLineVisible: false,
   });
-  state.priceChart.priceScale("basis").applyOptions({
-    scaleMargins: { top: 0.78, bottom: 0 },
-    borderColor: "#1c1c1c",
+  state.cvdChart.priceScale("basis").applyOptions({
+    scaleMargins: { top: 0.75, bottom: 0 },
     visible: false,
+  });
+  // Keep the CVD line in the top 75% so it never overlaps the basis bars.
+  state.cvdChart.priceScale("right").applyOptions({
+    scaleMargins: { top: 0.05, bottom: 0.28 },
   });
 
   state.cvdChart = LightweightCharts.createChart($("cvd-pane"), {
