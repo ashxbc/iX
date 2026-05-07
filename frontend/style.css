@@ -412,6 +412,9 @@ main {
 .funding-stat.disabled .stat-sub { opacity: 0.55; }
 .icon-btn:disabled { opacity: 0.35; cursor: not-allowed; }
 
+/* Alt-key crosshair hint on the price pane (anchored CVD) */
+#price.alt-hover { cursor: crosshair; }
+
 /* ============================================================
    Paper trading modal
    ============================================================ */

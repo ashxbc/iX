@@ -22,6 +22,7 @@ from cvd_engine import CVDEngine, TIMEFRAME_MS
 from divergence import detect_divergences
 from funding_engine import FundingOIEngine
 from gex_engine import GexEngine
+from iceberg_engine import IcebergEngine
 from liquidation_engine import LiquidationEngine
 from live_liq_engine import LiveLiquidationEngine
 from paper_engine import PaperEngine, valid_uid
@@ -95,6 +96,7 @@ async def lifespan(app: FastAPI):
     app.state.live_liq: dict[str, LiveLiquidationEngine] = {}
     app.state.taker: dict[str, TakerEngine] = {}
     app.state.gex: dict[str, GexEngine] = {}
+    app.state.iceberg: dict[str, IcebergEngine] = {}
     app.state.liquidation: dict[str, LiquidationEngine] = {}
     app.state.tasks: dict = {}
 
@@ -131,6 +133,10 @@ async def lifespan(app: FastAPI):
         # Live liquidation WS (forceOrder) — exists on every USDT-M perp
         app.state.live_liq[sym] = LiveLiquidationEngine(sym)
 
+        # Iceberg / whale-absorption detection — every USDT-M perp has trade
+        # tape + partial book streams.
+        app.state.iceberg[sym] = IcebergEngine(sym)
+
         # Taker ratio (kline_5m/15m/1h) — every perp
         taker_eng = TakerEngine(sym, store)
         app.state.taker[sym] = taker_eng
@@ -161,6 +167,8 @@ async def lifespan(app: FastAPI):
         app.state.tasks[("basis", sym)] = asyncio.create_task(e.run())
     for sym, e in app.state.live_liq.items():
         app.state.tasks[("live_liq", sym)] = asyncio.create_task(e.run())
+    for sym, e in app.state.iceberg.items():
+        app.state.tasks[("iceberg", sym)] = asyncio.create_task(e.run())
     for sym, e in app.state.taker.items():
         app.state.tasks[("taker", sym)] = asyncio.create_task(e.run())
     for sym, e in app.state.gex.items():
@@ -557,6 +565,50 @@ async def taker_feed(
     eng.on_update(listener)
     try:
         await ws.send_text(json.dumps({"event": "snapshot", "data": eng.snapshot_history()}))
+        await _ws_pump(ws, queue)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        eng.off_update(listener)
+
+
+@app.get("/api/iceberg", dependencies=[Depends(require_auth)])
+async def iceberg_status(symbol: str = DEFAULT_SYMBOL):
+    sym = (symbol or DEFAULT_SYMBOL).upper()
+    eng = app.state.iceberg.get(sym)
+    if eng is None:
+        return {"available": False, "snapshot": None, "symbol": sym}
+    return {"available": True, "snapshot": eng.snapshot(), "symbol": sym}
+
+
+@app.websocket("/ws/iceberg")
+async def iceberg_feed(
+    ws: WebSocket,
+    token: str | None = Query(default=None),
+    symbol: str = Query(default=DEFAULT_SYMBOL),
+):
+    if not _check_token(token):
+        await ws.close(code=4401)
+        return
+    sym = (symbol or DEFAULT_SYMBOL).upper()
+    eng = app.state.iceberg.get(sym)
+    if eng is None:
+        await ws.close(code=4404)
+        return
+    await ws.accept()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+
+    async def listener(event: str, payload: dict):
+        try:
+            queue.put_nowait({"event": event, "data": payload})
+        except asyncio.QueueFull:
+            pass
+
+    eng.on_update(listener)
+    try:
+        # Send current snapshot immediately
+        snap = eng.snapshot()
+        await ws.send_text(json.dumps({"event": "snapshot", "data": snap}))
         await _ws_pump(ws, queue)
     except WebSocketDisconnect:
         pass

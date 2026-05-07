@@ -22,6 +22,14 @@ const state = {
   takerWs: null,
   lastDivergences: [],
   takerDivMarker: null,
+  // Iceberg detection
+  icebergWs: null,
+  icebergLines: [],
+  // Anchored CVD
+  cvdData: [],          // [{time, value}] mirror of cvdSeries data
+  anchor: null,         // {time, price, cvd_value}
+  anchorPriceMarker: null,
+  anchoredCvdSeries: null,
   token: "",
 };
 
@@ -84,6 +92,9 @@ function resetSymbolViews() {
   }
   // Paper trade lines are only relevant on BTC.
   for (const id of Object.keys(paper.lines || {})) removeTradeLines(Number(id));
+  // Drop iceberg lines + anchor from previous symbol.
+  clearIcebergLines();
+  clearAnchor();
   // Drop divergence markers from the previous symbol.
   if (state.candleSeries && state.candleSeries.setMarkers) state.candleSeries.setMarkers([]);
   // Reset readouts.
@@ -109,7 +120,7 @@ function resetSymbolViews() {
 }
 
 function closeSymbolWses() {
-  for (const k of ["ws", "fundingWs", "basisWs", "takerWs", "gexWs", "liveLiqWs", "liqWs"]) {
+  for (const k of ["ws", "fundingWs", "basisWs", "takerWs", "gexWs", "liveLiqWs", "liqWs", "icebergWs"]) {
     const ws = state[k];
     if (ws) {
       // Null onclose so the auto-reconnect timer doesn't fire on stale symbol.
@@ -128,6 +139,7 @@ function reconnectAllForSymbol() {
   connectTaker();
   if (c.gex) connectGex();
   connectLiveLiq();
+  connectIceberg();
   if (state.liqVisible && c.heatmap) connectLiquidations();
 }
 
@@ -517,11 +529,15 @@ function applySnapshot(candles, divergences) {
   });
   state.candleSeries.setData(cs);
   state.cvdSeries.setData(ds);
+  // Mirror CVD data so anchored CVD can read historical values without
+  // touching the chart series internals.
+  state.cvdData = ds.filter((d) => d.value !== undefined).map((d) => ({ time: d.time, value: d.value }));
   // Anchor the taker pane to the same time grid so logical-range sync works.
   if (state.takerAnchorSeries) {
     state.takerAnchorSeries.setData(cs.map((c) => ({ time: c.time })));
   }
   applyDivergences(divergences || []);
+  refreshAnchoredCvd();
 
   // When the symbol changes the previous coin's price range is meaningless
   // for the new coin (BTC at 80k vs ETH at 3.5k). Auto-fit and re-enable
@@ -558,6 +574,15 @@ function applyTick(c) {
   state.cvdSeries.update(c.observed ? { time: t, value: c.cvd } : { time: t });
   // Extend the taker pane's time grid in lockstep with price.
   if (state.takerAnchorSeries) state.takerAnchorSeries.update({ time: t });
+  // Mirror CVD point and update anchored CVD if active.
+  if (c.observed) {
+    if (state.cvdData.length && state.cvdData[state.cvdData.length - 1].time === t) {
+      state.cvdData[state.cvdData.length - 1].value = c.cvd;
+    } else {
+      state.cvdData.push({ time: t, value: c.cvd });
+    }
+    if (state.anchor) updateAnchoredCvdLatest();
+  }
   state.lastPrice = c.close;
   $("px").textContent = fmt(c.close);
   $("cvd").textContent = fmt(c.cvd, 0);
@@ -1439,6 +1464,172 @@ function initPaperUi() {
 }
 
 /* ============================================================
+   Iceberg / whale absorption — horizontal lines on price chart
+   ============================================================ */
+
+function fmtUsdShort(v) {
+  if (v == null || Number.isNaN(v)) return "—";
+  const a = Math.abs(v);
+  if (a >= 1e9) return `$${(v/1e9).toFixed(2)}B`;
+  if (a >= 1e6) return `$${(v/1e6).toFixed(2)}M`;
+  if (a >= 1e3) return `$${(v/1e3).toFixed(1)}K`;
+  return `$${v.toFixed(0)}`;
+}
+
+function clearIcebergLines() {
+  if (!state.icebergLines || !state.candleSeries) return;
+  for (const line of state.icebergLines) {
+    try { state.candleSeries.removePriceLine(line); } catch {}
+  }
+  state.icebergLines = [];
+}
+
+function applyIcebergSnapshot(data) {
+  if (!data || !state.candleSeries) return;
+  clearIcebergLines();
+  const list = data.icebergs || [];
+  for (const ice of list) {
+    const color =
+      ice.side === "bid" ? "rgba(38,166,154,0.85)" :
+      ice.side === "ask" ? "rgba(239,83,80,0.85)" :
+                            "rgba(245,185,66,0.85)";
+    const line = state.candleSeries.createPriceLine({
+      price: ice.price,
+      color: color,
+      lineWidth: 2,
+      lineStyle: 1,    // dotted
+      axisLabelVisible: true,
+      title: `🐋 ${fmtUsdShort(ice.absorbed_usd)} · ${ice.ratio.toFixed(0)}x`,
+    });
+    state.icebergLines.push(line);
+  }
+}
+
+function connectIceberg() {
+  if (state.icebergWs) {
+    state.icebergWs.onclose = null;
+    state.icebergWs.close();
+  }
+  const url = `${WS_PROTO}://${BACKEND}/ws/iceberg?token=${encodeURIComponent(state.token)}${symParam()}`;
+  const ws = new WebSocket(url);
+  state.icebergWs = ws;
+  ws.onmessage = (m) => {
+    let msg;
+    try { msg = JSON.parse(m.data); } catch { return; }
+    if (msg.event === "snapshot") applyIcebergSnapshot(msg.data);
+  };
+  ws.onclose = () => setTimeout(connectIceberg, 3000);
+}
+
+/* ============================================================
+   Anchored CVD — shift+click on price chart drops anchor
+   ============================================================ */
+
+function findCvdAtTime(time) {
+  // Binary search the mirrored cvdData for the value at-or-just-before `time`.
+  const arr = state.cvdData;
+  if (!arr || !arr.length) return null;
+  let lo = 0, hi = arr.length - 1, best = null;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (arr[mid].time <= time) { best = arr[mid]; lo = mid + 1; }
+    else hi = mid - 1;
+  }
+  return best ? best.value : null;
+}
+
+function ensureAnchoredCvdSeries() {
+  if (state.anchoredCvdSeries || !state.cvdChart) return;
+  state.anchoredCvdSeries = state.cvdChart.addLineSeries({
+    color: "#c97cf4",
+    lineWidth: 2,
+    priceLineVisible: false,
+    lastValueVisible: true,
+    crosshairMarkerVisible: true,
+    title: "anchored",
+  });
+}
+
+function refreshAnchoredCvd() {
+  if (!state.anchor) return;
+  ensureAnchoredCvdSeries();
+  const baseline = findCvdAtTime(state.anchor.time);
+  if (baseline === null) return;
+  state.anchor.cvd_value = baseline;
+  const data = state.cvdData
+    .filter((p) => p.time >= state.anchor.time)
+    .map((p) => ({ time: p.time, value: p.value - baseline }));
+  state.anchoredCvdSeries.setData(data);
+}
+
+function updateAnchoredCvdLatest() {
+  if (!state.anchor || !state.anchoredCvdSeries) return;
+  const last = state.cvdData[state.cvdData.length - 1];
+  if (!last || last.time < state.anchor.time) return;
+  state.anchoredCvdSeries.update({
+    time: last.time,
+    value: last.value - (state.anchor.cvd_value || 0),
+  });
+}
+
+function setAnchor(time, price) {
+  clearAnchor();
+  state.anchor = { time, price, cvd_value: 0 };
+  // Vertical reference line on price chart
+  state.anchorPriceMarker = state.candleSeries.createPriceLine({
+    price: price,
+    color: "#c97cf4",
+    lineWidth: 1,
+    lineStyle: 2,    // dashed
+    axisLabelVisible: true,
+    title: `⚓ ${fmtUsd2(price)}`,
+  });
+  refreshAnchoredCvd();
+}
+
+function clearAnchor() {
+  if (state.anchorPriceMarker && state.candleSeries) {
+    try { state.candleSeries.removePriceLine(state.anchorPriceMarker); } catch {}
+  }
+  state.anchorPriceMarker = null;
+  if (state.anchoredCvdSeries && state.cvdChart) {
+    try { state.cvdChart.removeSeries(state.anchoredCvdSeries); } catch {}
+  }
+  state.anchoredCvdSeries = null;
+  state.anchor = null;
+}
+
+function attachAnchorHandler() {
+  // Alt+click drops an anchor (Shift is taken by the measure tool).
+  // Alt+click on/near an existing anchor removes it.
+  const pane = $("price");
+  // Visual cue when alt is held over the chart.
+  document.addEventListener("keydown", (e) => {
+    if (e.altKey) pane.classList.add("alt-hover");
+  });
+  document.addEventListener("keyup", () => pane.classList.remove("alt-hover"));
+  document.addEventListener("blur", () => pane.classList.remove("alt-hover"));
+
+  pane.addEventListener("click", (e) => {
+    if (!e.altKey) return;
+    if (!state.candleSeries || !state.priceChart) return;
+    const rect = pane.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const time = state.priceChart.timeScale().coordinateToTime(x);
+    const price = state.candleSeries.coordinateToPrice(y);
+    if (time == null || price == null) return;
+    if (state.anchor && Math.abs(state.anchor.time - time) < 60) {
+      clearAnchor();
+      return;
+    }
+    setAnchor(time, price);
+  });
+  // Crosshair hint when alt is held
+  pane.addEventListener("keydown", () => {});  // no-op; CSS handled below
+}
+
+/* ============================================================
    AI analysis
    ============================================================ */
 
@@ -1678,6 +1869,7 @@ async function init() {
   initPaperUi();
   connectPaperWs();
   initAiUi();
+  attachAnchorHandler();
 }
 
 init();
