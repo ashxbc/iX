@@ -1267,7 +1267,7 @@ function renderActiveTrades(opens) {
     const row = document.createElement("div");
     row.className = "trade-row";
     const pnlCls = t.unrealized_pnl >= 0 ? "up" : "down";
-    const pnlPct = (t.unrealized_pnl / t.margin) * 100;
+    const pnlPct = (t.unrealized_pnl / t.size_usd) * 100;
     const sym = symLabel(t.symbol);
     row.innerHTML = `
       <div class="col-side ${t.side}">${sym} ${t.side.toUpperCase()}</div>
