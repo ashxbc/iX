@@ -41,9 +41,14 @@ def valid_uid(uid: str | None) -> bool:
 
 
 class PaperEngine:
-    def __init__(self, store: Store, basis_engine):
+    def __init__(self, store: Store, mark_provider: Callable[[str], float]):
+        """
+        mark_provider(symbol) -> float : returns the current perp mark price
+        for that symbol (0.0 if unavailable). Lets us trade any of the 14 coins
+        regardless of which one provides spot data.
+        """
         self.store = store
-        self.basis = basis_engine     # supplies current perp mid via .perp
+        self._get_mark_for = mark_provider
         self._listeners: dict[str, list[Callable]] = defaultdict(list)
         self._running = False
 
@@ -65,8 +70,11 @@ class PaperEngine:
 
     # ---------- helpers ----------
 
-    def get_mark(self) -> float:
-        return float(getattr(self.basis, "perp", 0) or 0)
+    def get_mark(self, symbol: str) -> float:
+        try:
+            return float(self._get_mark_for(symbol) or 0)
+        except Exception:
+            return 0.0
 
     def get_account(self, uid: str) -> dict:
         return self.store.get_or_create_paper_account(uid, INITIAL_BALANCE)
@@ -84,10 +92,13 @@ class PaperEngine:
 
     # ---------- public actions ----------
 
-    def open_trade(self, uid: str, side: str, size_usd: float, leverage: float) -> dict:
+    def open_trade(self, uid: str, symbol: str, side: str, size_usd: float, leverage: float) -> dict:
         side = (side or "").lower()
         if side not in ("long", "short"):
             raise ValueError("side must be long or short")
+        symbol = (symbol or "").upper()
+        if not symbol:
+            raise ValueError("symbol is required")
         try:
             leverage = float(leverage)
             size_usd = float(size_usd)
@@ -98,9 +109,9 @@ class PaperEngine:
         if size_usd < MIN_SIZE_USD:
             raise ValueError(f"min size is ${MIN_SIZE_USD:.0f}")
 
-        mark = self.get_mark()
+        mark = self.get_mark(symbol)
         if mark <= 0:
-            raise ValueError("market price unavailable, try again in a moment")
+            raise ValueError(f"{symbol} mark price unavailable, try again in a moment")
 
         margin = size_usd / leverage
         acct = self.get_account(uid)
@@ -112,7 +123,7 @@ class PaperEngine:
         liq = self._liq_price(side, mark, leverage)
         ts_ms = int(time.time() * 1000)
         trade = self.store.insert_paper_trade(
-            uid, side, mark, size_usd, leverage, margin, liq, ts_ms,
+            uid, symbol, side, mark, size_usd, leverage, margin, liq, ts_ms,
         )
         self.store.update_paper_balance(uid, acct["balance"] - margin)
         return trade
@@ -123,9 +134,9 @@ class PaperEngine:
             raise ValueError("trade not found")
         if t["status"] != "open":
             raise ValueError("trade already closed")
-        mark = self.get_mark()
+        mark = self.get_mark(t["symbol"])
         if mark <= 0:
-            raise ValueError("market price unavailable")
+            raise ValueError(f"{t['symbol']} mark price unavailable")
         pnl = self._compute_pnl(t, mark)
         ts_ms = int(time.time() * 1000)
         self.store.close_paper_trade(t["id"], mark, ts_ms, pnl, "closed")
@@ -144,13 +155,13 @@ class PaperEngine:
     # ---------- snapshot ----------
 
     def account_snapshot(self, uid: str) -> dict:
-        mark = self.get_mark()
         acct = self.get_account(uid)
         opens = self.store.load_open_paper_trades(uid)
         live_opens = []
         unrealized = 0.0
         locked = 0.0
         for t in opens:
+            mark = self.get_mark(t["symbol"])
             pnl = self._compute_pnl(t, mark) if mark > 0 else 0.0
             unrealized += pnl
             locked += t["margin"]
@@ -162,7 +173,6 @@ class PaperEngine:
             "equity": equity,
             "locked": locked,
             "unrealized": unrealized,
-            "mark": mark,
             "open_trades": live_opens,
         }
 
@@ -177,14 +187,14 @@ class PaperEngine:
         while self._running:
             try:
                 await asyncio.sleep(TICK_INTERVAL_SEC)
-                mark = self.get_mark()
-                if mark <= 0:
-                    continue
                 users = self.store.users_with_open_paper_trades()
                 for uid in users:
                     opens = self.store.load_open_paper_trades(uid)
                     liquidated_ids = []
                     for t in opens:
+                        mark = self.get_mark(t["symbol"])
+                        if mark <= 0:
+                            continue   # no live mark — skip this trade this tick
                         breached = (
                             (t["side"] == "long" and mark <= t["liq_price"])
                             or (t["side"] == "short" and mark >= t["liq_price"])

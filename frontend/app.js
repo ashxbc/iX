@@ -139,6 +139,9 @@ function switchSymbol(newSym) {
   resetSymbolViews();
   applyCapabilities();
   reconnectAllForSymbol();
+  // Refresh the paper-trade form preview (button label, liq estimate) since
+  // they depend on the current symbol's mark price.
+  if (typeof updateTradePreview === "function") updateTradePreview();
 }
 
 async function verifyToken(token) {
@@ -519,6 +522,21 @@ function applySnapshot(candles, divergences) {
     state.takerAnchorSeries.setData(cs.map((c) => ({ time: c.time })));
   }
   applyDivergences(divergences || []);
+
+  // When the symbol changes the previous coin's price range is meaningless
+  // for the new coin (BTC at 80k vs ETH at 3.5k). Auto-fit and re-enable
+  // autoScale so the latest candles are visible immediately. If the user
+  // is still on the same symbol (mid-session reconnect), preserve their zoom.
+  if (state.lastSnapshotSymbol !== state.symbol) {
+    state.lastSnapshotSymbol = state.symbol;
+    try {
+      state.priceChart.priceScale("right").applyOptions({ autoScale: true });
+      state.cvdChart.priceScale("right").applyOptions({ autoScale: true });
+      state.priceChart.timeScale().fitContent();
+      state.cvdChart.timeScale().fitContent();
+      if (state.takerChart) state.takerChart.timeScale().fitContent();
+    } catch {}
+  }
 }
 
 function applyDivergences(divs) {
@@ -1141,7 +1159,8 @@ function liqPriceFor(side, mark, lev) {
 function updateTradePreview() {
   const size = Math.max(0, Number($("trade-size").value || 0));
   const lev  = Number($("trade-leverage").value || 1);
-  const mark = paper.account?.mark || state.lastPrice || 0;
+  // Mark = latest price on the price chart for the currently-displayed coin.
+  const mark = state.lastPrice || 0;
   const margin = lev > 0 ? size / lev : 0;
   $("lev-display").textContent = `${lev}x`;
   $("trade-margin").textContent = fmtUsd2(margin);
@@ -1151,7 +1170,7 @@ function updateTradePreview() {
   $("trade-liq").textContent = liq ? fmtUsd2(liq) : "—";
   const btn = $("open-trade-btn");
   btn.classList.toggle("short", paper.side === "short");
-  btn.textContent = `OPEN ${paper.side.toUpperCase()}`;
+  btn.textContent = `OPEN ${symLabel(state.symbol)} ${paper.side.toUpperCase()}`;
 }
 
 function setSide(side) {
@@ -1197,13 +1216,14 @@ function removeTradeLines(tradeId) {
 }
 
 function syncTradeLines(openTrades) {
-  const wanted = new Set(openTrades.map((t) => t.id));
-  // Remove lines for trades no longer open
+  // Only draw lines for trades on the currently-displayed symbol — a BTC
+  // trade's entry price means nothing on the ETH chart.
+  const onCurrent = openTrades.filter((t) => (t.symbol || "BTCUSDT").toUpperCase() === state.symbol);
+  const wanted = new Set(onCurrent.map((t) => t.id));
   for (const id of Object.keys(paper.lines)) {
     if (!wanted.has(Number(id))) removeTradeLines(Number(id));
   }
-  // Add lines for new ones
-  for (const t of openTrades) addTradeLines(t);
+  for (const t of onCurrent) addTradeLines(t);
 }
 
 /* ----- rendering ----- */
@@ -1235,6 +1255,10 @@ function applyPaperAccount(snap) {
   $("active-count").textContent = `(${cnt})`;
 }
 
+function symLabel(sym) {
+  return SYMBOL_LABEL[(sym || "").toUpperCase()] || (sym || "").replace(/USDT$/, "");
+}
+
 function renderActiveTrades(opens) {
   const wrap = $("active-trades");
   if (!wrap) return;
@@ -1244,8 +1268,9 @@ function renderActiveTrades(opens) {
     row.className = "trade-row";
     const pnlCls = t.unrealized_pnl >= 0 ? "up" : "down";
     const pnlPct = (t.unrealized_pnl / t.margin) * 100;
+    const sym = symLabel(t.symbol);
     row.innerHTML = `
-      <div class="col-side ${t.side}">${t.side.toUpperCase()}</div>
+      <div class="col-side ${t.side}">${sym} ${t.side.toUpperCase()}</div>
       <div class="col-lev">${t.leverage}x</div>
       <div>${fmtUsd2(t.entry_price)}</div>
       <div class="col-pnl ${pnlCls}">${fmtUsdSigned(t.unrealized_pnl)} <span class="col-lev">(${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%)</span></div>
@@ -1274,8 +1299,9 @@ function renderHistory(trades) {
     row.className = "trade-row compact";
     const pnlCls = (t.pnl_usd || 0) >= 0 ? "up" : "down";
     const date = t.close_ts ? new Date(t.close_ts).toLocaleString() : "—";
+    const sym = symLabel(t.symbol);
     row.innerHTML = `
-      <div class="col-side ${t.side}">${t.side.toUpperCase()}</div>
+      <div class="col-side ${t.side}">${sym} ${t.side.toUpperCase()}</div>
       <div class="col-lev">${t.leverage}x</div>
       <div>${fmtUsd2(t.entry_price)} → ${t.close_price ? fmtUsd2(t.close_price) : "—"}</div>
       <div class="col-pnl ${pnlCls}">${fmtUsdSigned(t.pnl_usd)}</div>
@@ -1303,7 +1329,11 @@ async function openTrade() {
   btn.disabled = true;
   try {
     const res = await paperPost("/api/paper/open", {
-      uid: paper.uid, side: paper.side, size_usd: size, leverage: lev,
+      uid: paper.uid,
+      symbol: state.symbol,
+      side: paper.side,
+      size_usd: size,
+      leverage: lev,
     });
     applyPaperAccount(res.account);
     await refreshHistory();

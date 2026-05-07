@@ -60,8 +60,16 @@ SYMBOLS = [
     "NEARUSDT", "ONDOUSDT", "ENAUSDT", "MONUSDT", "MEGAUSDT", "OPUSDT",
     "BNBUSDT", "XMRUSDT",
 ]
-# Coins with no Binance Spot pair — basis (spot vs perp) cannot be computed.
-SYMBOLS_NO_SPOT = {"HYPEUSDT", "MONUSDT", "XMRUSDT"}
+# Per-coin spot source. Coins missing from this map use Binance spot. Coins
+# without a Binance Spot pair fall back to the next-biggest exchange listing
+# the asset, so basis (spot vs perp) still works for them.
+ALT_SPOT_SOURCES: dict[str, dict] = {
+    "HYPEUSDT": {"exchange": "bybit",  "spot_symbol": "HYPEUSDT"},
+    "XMRUSDT":  {"exchange": "kucoin", "spot_symbol": "XMR-USDT"},
+    # MON: Monad mainnet listings are pre-market only on every major venue;
+    #      no reliable spot mid yet. Skip basis for it.
+}
+SYMBOLS_NO_SPOT = {"MONUSDT"}
 # GEX is only meaningful where a deep options market exists. Deribit lists
 # BTC and ETH (SOL exists but OI is too thin to be reliable). Map perp symbol
 # to Deribit currency code.
@@ -100,9 +108,18 @@ async def lifespan(app: FastAPI):
         app.state.funding[sym] = fund_eng
         seed_coros.append(fund_eng.seed_history())
 
-        # Basis — only when a Binance Spot pair exists for this base asset
+        # Basis — Binance spot by default, Bybit/KuCoin fallback for the
+        # coins Binance doesn't list spot. Only MON has no working spot.
         if sym not in SYMBOLS_NO_SPOT:
-            basis_eng = BasisEngine(sym, store)
+            alt = ALT_SPOT_SOURCES.get(sym)
+            if alt:
+                basis_eng = BasisEngine(
+                    sym, store,
+                    spot_exchange=alt["exchange"],
+                    spot_symbol=alt["spot_symbol"],
+                )
+            else:
+                basis_eng = BasisEngine(sym, store)
             app.state.basis[sym] = basis_eng
             seed_coros.append(basis_eng.seed_history())
 
@@ -146,10 +163,21 @@ async def lifespan(app: FastAPI):
     for sym, e in app.state.liquidation.items():
         app.state.tasks[("liq", sym)] = asyncio.create_task(e.run())
 
-    # Paper trading uses BTC perp mid as the mark (paper trading is BTC-only
-    # by design — keeps the leverage math simple and the demo focused).
-    btc_basis = app.state.basis.get("BTCUSDT")
-    paper_eng = PaperEngine(store, btc_basis)
+    # Paper trading mark provider: any of the 14 coins. Basis engine has the
+    # most accurate live mid (2s polling); CVD candles are the fallback when
+    # basis is unavailable for a coin (HYPE/MON/XMR or initial seeding).
+    def _mark_provider(symbol: str) -> float:
+        sym = (symbol or "").upper()
+        b = app.state.basis.get(sym)
+        if b is not None and getattr(b, "perp", 0) > 0:
+            return float(b.perp)
+        for tf in ("1m", "5m", "15m", "1h"):
+            eng = app.state.engines.get((sym.lower(), tf))
+            if eng and eng.candles and eng.candles[-1].close > 0:
+                return float(eng.candles[-1].close)
+        return 0.0
+
+    paper_eng = PaperEngine(store, _mark_provider)
     app.state.paper = paper_eng
     app.state.tasks[("paper",)] = asyncio.create_task(paper_eng.run())
 
@@ -319,9 +347,13 @@ async def paper_trades(uid: str = Query(...), limit: int = 100):
 async def paper_open(payload: dict):
     u = _paper_uid_or_400(payload.get("uid"))
     eng: PaperEngine = app.state.paper
+    sym = (payload.get("symbol") or DEFAULT_SYMBOL).upper()
+    if sym not in SYMBOLS:
+        raise HTTPException(status_code=400, detail=f"unsupported symbol {sym}")
     try:
         trade = eng.open_trade(
             u,
+            symbol=sym,
             side=payload.get("side", ""),
             size_usd=payload.get("size_usd", 0),
             leverage=payload.get("leverage", 1),

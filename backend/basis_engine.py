@@ -29,6 +29,49 @@ from storage import Store
 SPOT_API = "https://api.binance.com/api/v3/ticker/bookTicker"
 FAPI = "https://fapi.binance.com/fapi/v1/ticker/bookTicker"
 
+# Alternate spot sources for coins that lack a Binance Spot pair. The basis
+# engine accepts a `spot_source` config and dispatches accordingly.
+BYBIT_SPOT_API = "https://api.bybit.com/v5/market/tickers"
+KUCOIN_SPOT_API = "https://api.kucoin.com/api/v1/market/orderbook/level1"
+
+
+async def _fetch_spot_binance(client, symbol: str) -> float:
+    r = await client.get(SPOT_API, params={"symbol": symbol})
+    r.raise_for_status()
+    d = r.json()
+    bid = float(d.get("bidPrice") or 0)
+    ask = float(d.get("askPrice") or 0)
+    return (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0
+
+
+async def _fetch_spot_bybit(client, symbol: str) -> float:
+    r = await client.get(BYBIT_SPOT_API, params={"category": "spot", "symbol": symbol})
+    r.raise_for_status()
+    rows = (r.json().get("result") or {}).get("list") or []
+    if not rows:
+        return 0.0
+    d = rows[0]
+    bid = float(d.get("bid1Price") or 0)
+    ask = float(d.get("ask1Price") or 0)
+    return (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0
+
+
+async def _fetch_spot_kucoin(client, symbol: str) -> float:
+    # KuCoin uses dashed pairs e.g. XMR-USDT
+    r = await client.get(KUCOIN_SPOT_API, params={"symbol": symbol})
+    r.raise_for_status()
+    d = (r.json() or {}).get("data") or {}
+    bid = float(d.get("bestBid") or 0)
+    ask = float(d.get("bestAsk") or 0)
+    return (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0
+
+
+SPOT_FETCHERS = {
+    "binance": _fetch_spot_binance,
+    "bybit":   _fetch_spot_bybit,
+    "kucoin":  _fetch_spot_kucoin,
+}
+
 POLL_INTERVAL_SEC = 2          # live readout cadence
 PERSIST_INTERVAL_SEC = 60      # sample-to-DB cadence
 LOOKBACK_HOURS = 24            # how much history to keep in memory / send to client
@@ -41,9 +84,20 @@ PERP_LED_THRESHOLD = -0.02
 
 
 class BasisEngine:
-    def __init__(self, symbol: str, store: Store):
+    def __init__(self, symbol: str, store: Store,
+                 spot_exchange: str = "binance", spot_symbol: str | None = None):
+        """
+        spot_exchange : "binance" | "bybit" | "kucoin"
+        spot_symbol   : ticker on that exchange (defaults to perp symbol).
+                        e.g. "HYPEUSDT" on bybit, "XMR-USDT" on kucoin.
+        """
         self.symbol = symbol.upper()
         self.store = store
+        self.spot_exchange = spot_exchange
+        self.spot_symbol = (spot_symbol or symbol).upper()
+        if spot_exchange not in SPOT_FETCHERS:
+            raise ValueError(f"unknown spot_exchange: {spot_exchange}")
+        self._spot_fetch = SPOT_FETCHERS[spot_exchange]
         self.spot: float = 0.0
         self.perp: float = 0.0
         self.basis: float = 0.0
@@ -101,17 +155,20 @@ class BasisEngine:
                 backoff = min(backoff * 2, 30)
 
     async def _poll(self):
-        async with httpx.AsyncClient(timeout=5) as c:
-            spot_r, perp_r = await asyncio.gather(
-                c.get(SPOT_API, params={"symbol": self.symbol}),
+        async with httpx.AsyncClient(timeout=8) as c:
+            spot_mid_co, perp_r = await asyncio.gather(
+                self._spot_fetch(c, self.spot_symbol),
                 c.get(FAPI, params={"symbol": self.symbol}),
+                return_exceptions=True,
             )
-            spot_r.raise_for_status()
+            if isinstance(spot_mid_co, Exception):
+                raise spot_mid_co
+            if isinstance(perp_r, Exception):
+                raise perp_r
             perp_r.raise_for_status()
-            sd = spot_r.json()
             pd = perp_r.json()
 
-        spot_mid = (float(sd["bidPrice"]) + float(sd["askPrice"])) / 2
+        spot_mid = float(spot_mid_co or 0)
         perp_mid = (float(pd["bidPrice"]) + float(pd["askPrice"])) / 2
         if spot_mid <= 0 or perp_mid <= 0:
             return

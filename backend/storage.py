@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS paper_accounts (
 CREATE TABLE IF NOT EXISTS paper_trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL,
+    symbol TEXT NOT NULL DEFAULT 'BTCUSDT',
     side TEXT NOT NULL,
     entry_price REAL NOT NULL,
     size_usd REAL NOT NULL,
@@ -126,6 +127,13 @@ class Store:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(SCHEMA)
+        # Migration: paper_trades.symbol added later — backfill on existing DBs.
+        try:
+            self._conn.execute(
+                "ALTER TABLE paper_trades ADD COLUMN symbol TEXT NOT NULL DEFAULT 'BTCUSDT'"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
         self._conn.commit()
 
     def upsert(self, symbol: str, timeframe: str, c: dict):
@@ -293,14 +301,14 @@ class Store:
             )
             self._conn.commit()
 
-    def insert_paper_trade(self, user_id: str, side: str, entry_price: float, size_usd: float,
+    def insert_paper_trade(self, user_id: str, symbol: str, side: str, entry_price: float, size_usd: float,
                             leverage: float, margin: float, liq_price: float, ts_ms: int) -> dict:
         with self._lock:
             cur = self._conn.execute(
                 """INSERT INTO paper_trades
-                (user_id, side, entry_price, size_usd, leverage, margin, liq_price, status, entry_ts)
-                VALUES (?,?,?,?,?,?,?,?,?)""",
-                (user_id, side, entry_price, size_usd, leverage, margin, liq_price, "open", ts_ms),
+                (user_id, symbol, side, entry_price, size_usd, leverage, margin, liq_price, status, entry_ts)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (user_id, symbol.upper(), side, entry_price, size_usd, leverage, margin, liq_price, "open", ts_ms),
             )
             self._conn.commit()
             tid = cur.lastrowid
@@ -318,7 +326,7 @@ class Store:
     def load_paper_trade(self, trade_id: int) -> dict | None:
         with self._lock:
             row = self._conn.execute(
-                """SELECT id, user_id, side, entry_price, size_usd, leverage, margin, liq_price,
+                """SELECT id, user_id, symbol, side, entry_price, size_usd, leverage, margin, liq_price,
                           status, entry_ts, close_price, close_ts, pnl_usd
                    FROM paper_trades WHERE id=?""",
                 (trade_id,),
@@ -326,42 +334,42 @@ class Store:
         if not row:
             return None
         return {
-            "id": row[0], "user_id": row[1], "side": row[2], "entry_price": row[3],
-            "size_usd": row[4], "leverage": row[5], "margin": row[6], "liq_price": row[7],
-            "status": row[8], "entry_ts": row[9], "close_price": row[10],
-            "close_ts": row[11], "pnl_usd": row[12],
+            "id": row[0], "user_id": row[1], "symbol": row[2], "side": row[3], "entry_price": row[4],
+            "size_usd": row[5], "leverage": row[6], "margin": row[7], "liq_price": row[8],
+            "status": row[9], "entry_ts": row[10], "close_price": row[11],
+            "close_ts": row[12], "pnl_usd": row[13],
         }
 
     def load_open_paper_trades(self, user_id: str) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                """SELECT id, user_id, side, entry_price, size_usd, leverage, margin, liq_price,
+                """SELECT id, user_id, symbol, side, entry_price, size_usd, leverage, margin, liq_price,
                           status, entry_ts, close_price, close_ts, pnl_usd
                    FROM paper_trades WHERE user_id=? AND status='open'
                    ORDER BY entry_ts DESC""",
                 (user_id,),
             ).fetchall()
         return [
-            {"id": r[0], "user_id": r[1], "side": r[2], "entry_price": r[3],
-             "size_usd": r[4], "leverage": r[5], "margin": r[6], "liq_price": r[7],
-             "status": r[8], "entry_ts": r[9], "close_price": r[10],
-             "close_ts": r[11], "pnl_usd": r[12]} for r in rows
+            {"id": r[0], "user_id": r[1], "symbol": r[2], "side": r[3], "entry_price": r[4],
+             "size_usd": r[5], "leverage": r[6], "margin": r[7], "liq_price": r[8],
+             "status": r[9], "entry_ts": r[10], "close_price": r[11],
+             "close_ts": r[12], "pnl_usd": r[13]} for r in rows
         ]
 
     def load_paper_trades(self, user_id: str, limit: int = 100) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                """SELECT id, user_id, side, entry_price, size_usd, leverage, margin, liq_price,
+                """SELECT id, user_id, symbol, side, entry_price, size_usd, leverage, margin, liq_price,
                           status, entry_ts, close_price, close_ts, pnl_usd
                    FROM paper_trades WHERE user_id=?
                    ORDER BY entry_ts DESC LIMIT ?""",
                 (user_id, limit),
             ).fetchall()
         return [
-            {"id": r[0], "user_id": r[1], "side": r[2], "entry_price": r[3],
-             "size_usd": r[4], "leverage": r[5], "margin": r[6], "liq_price": r[7],
-             "status": r[8], "entry_ts": r[9], "close_price": r[10],
-             "close_ts": r[11], "pnl_usd": r[12]} for r in rows
+            {"id": r[0], "user_id": r[1], "symbol": r[2], "side": r[3], "entry_price": r[4],
+             "size_usd": r[5], "leverage": r[6], "margin": r[7], "liq_price": r[8],
+             "status": r[9], "entry_ts": r[10], "close_price": r[11],
+             "close_ts": r[12], "pnl_usd": r[13]} for r in rows
         ]
 
     def users_with_open_paper_trades(self) -> list[str]:
