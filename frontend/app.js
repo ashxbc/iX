@@ -171,7 +171,10 @@ function connectFunding() {
 const chartOpts = {
   layout: { background: { color: "#0a0a0a" }, textColor: "#999" },
   grid: { vertLines: { color: "#141414" }, horzLines: { color: "#141414" } },
-  rightPriceScale: { borderColor: "#1c1c1c" },
+  // Fixed minimum width on the right scale so the time-axis pixel grid is
+  // identical across all panes — without this, panes drift sideways when
+  // axis labels differ in width.
+  rightPriceScale: { borderColor: "#1c1c1c", minimumWidth: 64 },
   timeScale: {
     borderColor: "#1c1c1c",
     timeVisible: true,
@@ -243,19 +246,21 @@ function buildCharts() {
     autoScale: true,
   });
 
-  // Sync time scales between panes — guarded to prevent feedback loop.
+  // Sync time scales between panes by ACTUAL time (not logical bar index) so
+  // panes with different bar densities (taker 1h vs price 1m/5m) stay aligned
+  // even at the right edge. Guarded to prevent feedback loops.
+  const charts = [state.priceChart, state.cvdChart, state.takerChart];
   let syncing = false;
-  const sync = (src, dst) => src.timeScale().subscribeVisibleLogicalRangeChange((r) => {
+  const broadcast = (src) => src.timeScale().subscribeVisibleTimeRangeChange((r) => {
     if (!r || syncing) return;
     syncing = true;
-    try { dst.timeScale().setVisibleLogicalRange(r); } finally { syncing = false; }
+    try {
+      for (const c of charts) {
+        if (c !== src) c.timeScale().setVisibleRange(r);
+      }
+    } finally { syncing = false; }
   });
-  sync(state.priceChart, state.cvdChart);
-  sync(state.cvdChart, state.priceChart);
-  sync(state.priceChart, state.takerChart);
-  sync(state.takerChart, state.priceChart);
-  sync(state.cvdChart, state.takerChart);
-  sync(state.takerChart, state.cvdChart);
+  charts.forEach(broadcast);
 
   const onResize = () => {
     state.priceChart.applyOptions({ width: $("price").clientWidth, height: $("price").clientHeight });
@@ -469,6 +474,14 @@ function applyTakerLegend(snap) {
     el.style.color =
       v == null ? "var(--fg)" :
       v >= 0.5  ? "var(--up)" : "var(--down)";
+    // Real-time line update — paint the in-progress bar's current ratio so the
+    // line extends with each kline tick, not just on bar close.
+    if (state.takerSeries[tf] && t.ts != null && t.ratio != null) {
+      state.takerSeries[tf].update({
+        time: Math.floor(t.ts / 1000),
+        value: t.ratio,
+      });
+    }
   }
   const reg = snap.regime || "neutral";
   const lbl = REGIME_LABEL[reg] || REGIME_LABEL.neutral;
