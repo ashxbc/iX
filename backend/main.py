@@ -20,6 +20,7 @@ from basis_engine import BasisEngine
 from cvd_engine import CVDEngine, TIMEFRAME_MS
 from divergence import detect_divergences
 from funding_engine import FundingOIEngine
+from gex_engine import GexEngine
 from liquidation_engine import LiquidationEngine
 from live_liq_engine import LiveLiquidationEngine
 from taker_engine import TakerEngine
@@ -100,6 +101,13 @@ async def lifespan(app: FastAPI):
     app.state.taker = taker_eng
     app.state.taker_task = asyncio.create_task(taker_eng.run())
 
+    # Options Gamma Exposure engine (Deribit BTC options, 5min poll)
+    print("[boot] starting GEX engine (Deribit BTC options)")
+    gex_eng = GexEngine("BTCUSDT", store)
+    await gex_eng.seed_history()
+    app.state.gex = gex_eng
+    app.state.gex_task = asyncio.create_task(gex_eng.run())
+
     # Liquidation heatmap engine (BTC only)
     app.state.liquidation = None
     app.state.liquidation_task = None
@@ -118,7 +126,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         extra_tasks = []
-        for attr in ("funding_task", "basis_task", "liquidation_task", "live_liq_task", "taker_task"):
+        for attr in ("funding_task", "basis_task", "liquidation_task", "live_liq_task", "taker_task", "gex_task"):
             t = getattr(app.state, attr, None)
             if t is not None:
                 t.cancel()
@@ -204,6 +212,42 @@ async def basis_feed(ws: WebSocket, token: str | None = Query(default=None)):
     eng.on_update(listener)
     try:
         await ws.send_text(json.dumps({"event": "snapshot", "data": eng.snapshot_history()}))
+        while True:
+            msg = await queue.get()
+            await ws.send_text(json.dumps(msg))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        eng.off_update(listener)
+
+
+@app.get("/api/gex", dependencies=[Depends(require_auth)])
+async def gex_status():
+    eng: GexEngine = app.state.gex
+    snap = eng.snapshot()
+    return {"snapshot": snap}
+
+
+@app.websocket("/ws/gex")
+async def gex_feed(ws: WebSocket, token: str | None = Query(default=None)):
+    if not _check_token(token):
+        await ws.close(code=4401)
+        return
+    eng: GexEngine = app.state.gex
+    await ws.accept()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+
+    async def listener(event: str, payload: dict):
+        try:
+            queue.put_nowait({"event": event, "data": payload})
+        except asyncio.QueueFull:
+            pass
+
+    eng.on_update(listener)
+    try:
+        snap = eng.snapshot()
+        if snap is not None:
+            await ws.send_text(json.dumps({"event": "snapshot", "data": snap}))
         while True:
             msg = await queue.get()
             await ws.send_text(json.dumps(msg))

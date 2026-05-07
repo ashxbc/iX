@@ -129,16 +129,108 @@ function applyFunding(c) {
   oiSub.textContent = `1h ${chg >= 0 ? "+" : ""}${chgPct}%`;
   oiSub.style.color = chg > 0 ? "var(--up)" : chg < 0 ? "var(--down)" : "var(--mute)";
 
-  const sig = c.signal || "neutral";
+  state.lastFundingSig = c.signal || "neutral";
+  recomputeSignal();
+}
+
+/* ---------- Composite signal: funding + taker + GEX ---------- */
+
+const SIG_LABEL = {
+  explosive_long:  { text: "EXPLOSIVE LONG",   sub: "vol expansion + bull flow + shorts trapped" },
+  explosive_short: { text: "EXPLOSIVE SHORT",  sub: "vol expansion + bear flow + longs trapped" },
+  breakout_long:   { text: "BREAKOUT ↑",  sub: "buyers pressing pinned range — break imminent" },
+  breakout_short:  { text: "BREAKOUT ↓",  sub: "sellers pressing pinned range — break imminent" },
+  pinned:          { text: "PINNED",           sub: "vol suppressed in dealer zone" },
+  explosive:       { text: "EXPLOSIVE VOL",    sub: "no directional confirmation yet" },
+  squeeze:         { text: "SQUEEZE",          sub: "shorts trapped — bullish" },
+  flush:           { text: "FLUSH",            sub: "longs trapped — bearish" },
+  neutral:         { text: "NEUTRAL",          sub: "no setup" },
+};
+
+// Map composite signal -> existing funding-anim animation state. Reuses the
+// squeeze/flush/explosive/neutral CSS animations rather than inventing new ones.
+const ANIM_MAP = {
+  explosive_long:  "squeeze",
+  explosive_short: "flush",
+  breakout_long:   "squeeze",
+  breakout_short:  "flush",
+  pinned:          "neutral",
+  explosive:       "explosive",
+  squeeze:         "squeeze",
+  flush:           "flush",
+  neutral:         "neutral",
+};
+
+function recomputeSignal() {
+  const f  = state.lastFundingSig || "neutral";
+  const t  = state.lastTakerRegime || "neutral";
+  const gs = state.lastGex?.state || "neutral";
+
+  const bullStrong = t === "bull_strong";
+  const bearStrong = t === "bear_strong";
+
+  let sig;
+  // Highest conviction first: vol regime + flow + funding all aligned.
+  if (gs === "explosive" && bullStrong && f === "squeeze") sig = "explosive_long";
+  else if (gs === "explosive" && bearStrong && f === "flush") sig = "explosive_short";
+  // Pinning + strong directional taker = pressure building against the pin.
+  else if (gs === "pinning" && bullStrong) sig = "breakout_long";
+  else if (gs === "pinning" && bearStrong) sig = "breakout_short";
+  // GEX regime alone (no taker / funding confirmation).
+  else if (gs === "pinning")   sig = "pinned";
+  else if (gs === "explosive") sig = "explosive";
+  // Fall back to funding-only signals when GEX is neutral.
+  else if (f === "squeeze") sig = "squeeze";
+  else if (f === "flush")   sig = "flush";
+  else                       sig = "neutral";
+
+  const lbl = SIG_LABEL[sig];
+  const animState = ANIM_MAP[sig] || "neutral";
   const anim = $("funding-anim");
   const sigBox = $("funding-signal");
-  anim.dataset.state = sig;
-  sigBox.dataset.state = sig;
-  $("signal-text").textContent = sig.toUpperCase();
-  $("signal-sub").textContent =
-    sig === "squeeze" ? "shorts trapped — bullish" :
-    sig === "flush"   ? "longs trapped — bearish" :
-                        "no setup";
+  if (anim && anim.dataset.state !== animState) anim.dataset.state = animState;
+  if (sigBox && sigBox.dataset.state !== sig)   sigBox.dataset.state = sig;
+  const txtEl = $("signal-text");
+  const subEl = $("signal-sub");
+  if (txtEl) txtEl.textContent = lbl.text;
+  if (subEl) subEl.textContent = lbl.sub;
+}
+
+/* ---------- Options Gamma Exposure (GEX) ---------- */
+
+function applyGex(snap) {
+  if (!snap) return;
+  state.lastGex = snap;
+  const stat = $("gex-stat");
+  if (stat) stat.dataset.state = snap.state || "neutral";
+  const valEl = $("gex-val");
+  const subEl = $("gex-sub");
+  if (valEl) {
+    valEl.textContent =
+      snap.state === "pinning"   ? "PINNING"   :
+      snap.state === "explosive" ? "EXPLOSIVE" : "NEUTRAL";
+  }
+  if (subEl) {
+    subEl.textContent = snap.flip_zone
+      ? `flip $${(snap.flip_zone / 1000).toFixed(1)}k`
+      : "flip —";
+  }
+  recomputeSignal();
+}
+
+function connectGex() {
+  if (state.gexWs) {
+    state.gexWs.onclose = null;
+    state.gexWs.close();
+  }
+  const url = `${WS_PROTO}://${BACKEND}/ws/gex?token=${encodeURIComponent(state.token)}`;
+  const ws = new WebSocket(url);
+  state.gexWs = ws;
+  ws.onmessage = (m) => {
+    const msg = JSON.parse(m.data);
+    if (msg.event === "snapshot" || msg.event === "tick") applyGex(msg.data);
+  };
+  ws.onclose = () => setTimeout(connectGex, 5000);
 }
 
 let fundingCountdownTimer = null;
@@ -503,6 +595,8 @@ function applyTakerLegend(snap) {
     }
   }
   const reg = snap.regime || "neutral";
+  state.lastTakerRegime = reg;
+  recomputeSignal();
   const lbl = REGIME_LABEL[reg] || REGIME_LABEL.neutral;
   const wrap = $("taker-regime");
   wrap.dataset.regime = reg;
@@ -896,6 +990,7 @@ async function init() {
   connectFunding();
   connectBasis();
   connectTaker();
+  connectGex();
   connectLiveLiq();
   if (state.liqVisible) connectLiquidations();
 }

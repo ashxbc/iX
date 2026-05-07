@@ -68,6 +68,19 @@ CREATE TABLE IF NOT EXISTS basis (
 );
 CREATE INDEX IF NOT EXISTS idx_basis_s ON basis(symbol, ts DESC);
 
+CREATE TABLE IF NOT EXISTS gex_snapshots (
+    symbol TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    spot REAL NOT NULL,
+    flip_zone REAL NOT NULL,
+    total_call_gex REAL NOT NULL,
+    total_put_gex REAL NOT NULL,
+    net_gex REAL NOT NULL,
+    state TEXT NOT NULL,
+    PRIMARY KEY (symbol, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_gex_s ON gex_snapshots(symbol, ts DESC);
+
 CREATE TABLE IF NOT EXISTS taker_ratios (
     symbol TEXT NOT NULL,
     timeframe TEXT NOT NULL,
@@ -228,6 +241,22 @@ class Store:
             {"ts": r[0], "spot": r[1], "perp": r[2], "basis": r[3], "basis_pct": r[4]}
             for r in rows
         ]
+
+    def upsert_gex(self, symbol: str, ts: int, spot: float, flip_zone: float,
+                   total_call_gex: float, total_put_gex: float, net_gex: float, state: str):
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO gex_snapshots
+                (symbol, ts, spot, flip_zone, total_call_gex, total_put_gex, net_gex, state)
+                VALUES (?,?,?,?,?,?,?,?)
+                ON CONFLICT(symbol, ts) DO UPDATE SET
+                    spot=excluded.spot, flip_zone=excluded.flip_zone,
+                    total_call_gex=excluded.total_call_gex,
+                    total_put_gex=excluded.total_put_gex,
+                    net_gex=excluded.net_gex, state=excluded.state""",
+                (symbol, ts, spot, flip_zone, total_call_gex, total_put_gex, net_gex, state),
+            )
+            self._conn.commit()
 
     def upsert_taker(self, symbol: str, timeframe: str, ts: int, qv: float, taker_buy_qv: float, ratio: float):
         with self._lock:
