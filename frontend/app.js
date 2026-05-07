@@ -13,8 +13,14 @@ const state = {
   ws: null,
   priceChart: null,
   cvdChart: null,
+  takerChart: null,
   candleSeries: null,
   cvdSeries: null,
+  takerSeries: { "5m": null, "15m": null, "1h": null },
+  takerBaseline: null,
+  takerWs: null,
+  lastDivergences: [],
+  takerDivMarker: null,
   token: "",
 };
 
@@ -179,6 +185,7 @@ const chartOpts = {
 function buildCharts() {
   if (state.priceChart) state.priceChart.remove();
   if (state.cvdChart) state.cvdChart.remove();
+  if (state.takerChart) state.takerChart.remove();
 
   state.priceChart = LightweightCharts.createChart($("price"), chartOpts);
   state.candleSeries = state.priceChart.addCandlestickSeries({
@@ -213,6 +220,29 @@ function buildCharts() {
     scaleMargins: { top: 0.05, bottom: 0.28 },
   });
 
+  // Taker pane — 3 lines (5m / 15m / 1h ratio) + 0.5 baseline
+  state.takerChart = LightweightCharts.createChart($("taker-pane"), {
+    ...chartOpts,
+    timeScale: { ...chartOpts.timeScale, visible: false },
+  });
+  state.takerSeries["5m"]  = state.takerChart.addLineSeries({
+    color: "#26a69a", lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
+  });
+  state.takerSeries["15m"] = state.takerChart.addLineSeries({
+    color: "#f5b942", lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
+  });
+  state.takerSeries["1h"]  = state.takerChart.addLineSeries({
+    color: "#c97cf4", lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
+  });
+  // 0.5 = neutral baseline. Above = buyers aggressive, below = sellers aggressive.
+  state.takerSeries["5m"].createPriceLine({
+    price: 0.5, color: "#3a3a3a", lineStyle: 0, lineWidth: 1, axisLabelVisible: true, title: "0.5",
+  });
+  state.takerChart.priceScale("right").applyOptions({
+    scaleMargins: { top: 0.15, bottom: 0.15 },
+    autoScale: true,
+  });
+
   // Sync time scales between panes — guarded to prevent feedback loop.
   let syncing = false;
   const sync = (src, dst) => src.timeScale().subscribeVisibleLogicalRangeChange((r) => {
@@ -222,10 +252,15 @@ function buildCharts() {
   });
   sync(state.priceChart, state.cvdChart);
   sync(state.cvdChart, state.priceChart);
+  sync(state.priceChart, state.takerChart);
+  sync(state.takerChart, state.priceChart);
+  sync(state.cvdChart, state.takerChart);
+  sync(state.takerChart, state.cvdChart);
 
   const onResize = () => {
     state.priceChart.applyOptions({ width: $("price").clientWidth, height: $("price").clientHeight });
     state.cvdChart.applyOptions({ width: $("cvd-pane").clientWidth, height: $("cvd-pane").clientHeight });
+    state.takerChart.applyOptions({ width: $("taker-pane").clientWidth, height: $("taker-pane").clientHeight });
     resizeLiqCanvas();
     drawHeatmap();
   };
@@ -405,6 +440,104 @@ function connectBasis() {
     }
   };
   ws.onclose = () => setTimeout(connectBasis, 2000);
+}
+
+/* ---------- Taker buy/sell ratio ---------- */
+
+const REGIME_LABEL = {
+  bull_strong: { text: "STRONG BULL FLOW", sub: "all timeframes aggressive buys" },
+  bull:        { text: "BULL FLOW",         sub: "buyers aggressive across TFs" },
+  bear_strong: { text: "STRONG BEAR FLOW", sub: "all timeframes aggressive sells" },
+  bear:        { text: "BEAR FLOW",         sub: "sellers aggressive across TFs" },
+  diverging:   { text: "DIVERGING",         sub: "timeframes disagree — fade or wait" },
+  neutral:     { text: "NEUTRAL",           sub: "balanced flow" },
+};
+
+function fmtTaker(v) {
+  if (v === null || v === undefined || Number.isNaN(v)) return "—";
+  return Number(v).toFixed(3);
+}
+
+function applyTakerLegend(snap) {
+  if (!snap || !snap.tfs) return;
+  for (const tf of ["5m", "15m", "1h"]) {
+    const t = snap.tfs[tf];
+    const el = $(`taker-${tf}`);
+    if (!el || !t) continue;
+    const v = t.ema ?? t.ratio;
+    el.textContent = fmtTaker(v);
+    el.style.color =
+      v == null ? "var(--fg)" :
+      v >= 0.5  ? "var(--up)" : "var(--down)";
+  }
+  const reg = snap.regime || "neutral";
+  const lbl = REGIME_LABEL[reg] || REGIME_LABEL.neutral;
+  const wrap = $("taker-regime");
+  wrap.dataset.regime = reg;
+  $("taker-regime-text").textContent = lbl.text;
+  // If a divergence is active, override the sub line — it's the real signal.
+  if (snap.divergence) {
+    $("taker-regime-sub").textContent =
+      (snap.divergence.type === "bullish" ? "BULL DIV" : "BEAR DIV") +
+      " · " + snap.divergence.note;
+  } else {
+    $("taker-regime-sub").textContent = lbl.sub;
+  }
+}
+
+function takerSeriesData(history) {
+  // history per TF -> array of {ts, ratio} -> {time, value} dedup + sorted
+  const out = {};
+  for (const tf of ["5m", "15m", "1h"]) {
+    const seen = new Set();
+    const data = [];
+    for (const b of (history?.[tf] || [])) {
+      const t = Math.floor(b.ts / 1000);
+      if (seen.has(t)) continue;
+      seen.add(t);
+      data.push({ time: t, value: b.ratio });
+    }
+    data.sort((a, b) => a.time - b.time);
+    out[tf] = data;
+  }
+  return out;
+}
+
+function applyTakerSnapshot(snap) {
+  if (!snap) return;
+  const data = takerSeriesData(snap.history || {});
+  for (const tf of ["5m", "15m", "1h"]) {
+    if (state.takerSeries[tf]) state.takerSeries[tf].setData(data[tf]);
+  }
+  applyTakerLegend(snap.current);
+}
+
+function applyTakerBar(payload) {
+  // payload: { tf, ts, ratio, ema, qv, close }
+  const s = state.takerSeries[payload.tf];
+  if (!s) return;
+  s.update({ time: Math.floor(payload.ts / 1000), value: payload.ratio });
+}
+
+function connectTaker() {
+  if (state.takerWs) {
+    state.takerWs.onclose = null;
+    state.takerWs.close();
+  }
+  const url = `${WS_PROTO}://${BACKEND}/ws/taker?token=${encodeURIComponent(state.token)}`;
+  const ws = new WebSocket(url);
+  state.takerWs = ws;
+  ws.onmessage = (m) => {
+    const msg = JSON.parse(m.data);
+    if (msg.event === "snapshot") {
+      applyTakerSnapshot(msg.data);
+    } else if (msg.event === "bar") {
+      applyTakerBar(msg.data);
+    } else if (msg.event === "tick") {
+      applyTakerLegend(msg.data);
+    }
+  };
+  ws.onclose = () => setTimeout(connectTaker, 2000);
 }
 
 /* ---------- Live liquidation flash labels ---------- */
@@ -730,6 +863,7 @@ async function init() {
   connect();
   connectFunding();
   connectBasis();
+  connectTaker();
   connectLiveLiq();
   if (state.liqVisible) connectLiquidations();
 }

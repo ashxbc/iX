@@ -22,6 +22,7 @@ from divergence import detect_divergences
 from funding_engine import FundingOIEngine
 from liquidation_engine import LiquidationEngine
 from live_liq_engine import LiveLiquidationEngine
+from taker_engine import TakerEngine
 from storage import Store
 
 
@@ -92,6 +93,13 @@ async def lifespan(app: FastAPI):
     app.state.live_liq = live_liq
     app.state.live_liq_task = asyncio.create_task(live_liq.run())
 
+    # Taker buy/sell ratio engine (multi-TF, BTC only)
+    print("[boot] starting taker ratio engine (BTCUSDT, 5m/15m/1h)")
+    taker_eng = TakerEngine("BTCUSDT", store)
+    await taker_eng.seed_history()
+    app.state.taker = taker_eng
+    app.state.taker_task = asyncio.create_task(taker_eng.run())
+
     # Liquidation heatmap engine (BTC only)
     app.state.liquidation = None
     app.state.liquidation_task = None
@@ -110,7 +118,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         extra_tasks = []
-        for attr in ("funding_task", "basis_task", "liquidation_task", "live_liq_task"):
+        for attr in ("funding_task", "basis_task", "liquidation_task", "live_liq_task", "taker_task"):
             t = getattr(app.state, attr, None)
             if t is not None:
                 t.cancel()
@@ -184,6 +192,39 @@ async def basis_feed(ws: WebSocket, token: str | None = Query(default=None)):
         await ws.close(code=4401)
         return
     eng: BasisEngine = app.state.basis
+    await ws.accept()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=400)
+
+    async def listener(event: str, payload: dict):
+        try:
+            queue.put_nowait({"event": event, "data": payload})
+        except asyncio.QueueFull:
+            pass
+
+    eng.on_update(listener)
+    try:
+        await ws.send_text(json.dumps({"event": "snapshot", "data": eng.snapshot_history()}))
+        while True:
+            msg = await queue.get()
+            await ws.send_text(json.dumps(msg))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        eng.off_update(listener)
+
+
+@app.get("/api/taker", dependencies=[Depends(require_auth)])
+async def taker_status():
+    eng: TakerEngine = app.state.taker
+    return eng.snapshot_history()
+
+
+@app.websocket("/ws/taker")
+async def taker_feed(ws: WebSocket, token: str | None = Query(default=None)):
+    if not _check_token(token):
+        await ws.close(code=4401)
+        return
+    eng: TakerEngine = app.state.taker
     await ws.accept()
     queue: asyncio.Queue = asyncio.Queue(maxsize=400)
 

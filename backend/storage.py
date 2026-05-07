@@ -67,6 +67,17 @@ CREATE TABLE IF NOT EXISTS basis (
     PRIMARY KEY (symbol, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_basis_s ON basis(symbol, ts DESC);
+
+CREATE TABLE IF NOT EXISTS taker_ratios (
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    qv REAL NOT NULL,
+    taker_buy_qv REAL NOT NULL,
+    ratio REAL NOT NULL,
+    PRIMARY KEY (symbol, timeframe, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_taker_st ON taker_ratios(symbol, timeframe, ts DESC);
 """
 
 
@@ -217,6 +228,26 @@ class Store:
             {"ts": r[0], "spot": r[1], "perp": r[2], "basis": r[3], "basis_pct": r[4]}
             for r in rows
         ]
+
+    def upsert_taker(self, symbol: str, timeframe: str, ts: int, qv: float, taker_buy_qv: float, ratio: float):
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO taker_ratios (symbol, timeframe, ts, qv, taker_buy_qv, ratio) VALUES (?,?,?,?,?,?)
+                ON CONFLICT(symbol, timeframe, ts) DO UPDATE SET
+                    qv=excluded.qv, taker_buy_qv=excluded.taker_buy_qv, ratio=excluded.ratio""",
+                (symbol, timeframe, ts, qv, taker_buy_qv, ratio),
+            )
+            self._conn.commit()
+
+    def load_taker(self, symbol: str, timeframe: str, limit: int = 500) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT ts, qv, taker_buy_qv, ratio FROM taker_ratios
+                WHERE symbol=? AND timeframe=? ORDER BY ts DESC LIMIT ?""",
+                (symbol, timeframe, limit),
+            ).fetchall()
+        rows.reverse()
+        return [{"ts": r[0], "qv": r[1], "taker_buy_qv": r[2], "ratio": r[3]} for r in rows]
 
     def last_liquidation_ts(self, symbol: str) -> int | None:
         with self._lock:

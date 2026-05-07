@@ -58,6 +58,19 @@
     <main style="display: none">
       <div id="price" class="pane"></div>
       <div id="cvd-pane" class="pane"></div>
+      <div id="taker-pane" class="pane">
+        <div class="taker-overlay">
+          <div class="taker-legend">
+            <span class="lg lg-5m">5m <b id="taker-5m">—</b></span>
+            <span class="lg lg-15m">15m <b id="taker-15m">—</b></span>
+            <span class="lg lg-1h">1h <b id="taker-1h">—</b></span>
+          </div>
+          <div class="taker-regime" id="taker-regime" data-regime="neutral">
+            <span class="rg-text" id="taker-regime-text">—</span>
+            <span class="rg-sub" id="taker-regime-sub"></span>
+          </div>
+        </div>
+      </div>
       <div id="funding-pane" class="funding-pane">
         <div class="funding-anim" id="funding-anim" data-state="neutral">
           <div class="anim-dot"></div>
