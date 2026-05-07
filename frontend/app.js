@@ -1438,6 +1438,177 @@ function initPaperUi() {
   updateTradePreview();
 }
 
+/* ============================================================
+   AI analysis
+   ============================================================ */
+
+const ai = {
+  ws: null,
+  running: false,
+  buffer: "",
+};
+
+const AI_PHASE_ORDER = ["reading", "context", "metrics", "connecting", "thinking", "synthesizing", "complete"];
+
+function aiSetPhase(phase) {
+  const phases = document.querySelectorAll("#ai-phases li");
+  const idx = AI_PHASE_ORDER.indexOf(phase);
+  phases.forEach((li) => {
+    const i = AI_PHASE_ORDER.indexOf(li.dataset.phase);
+    li.classList.remove("active", "done");
+    if (i < idx) li.classList.add("done");
+    else if (i === idx) li.classList.add("active");
+  });
+}
+
+function aiResetUi() {
+  $("ai-symbol-display").textContent = symLabel(state.symbol);
+  $("ai-intro").hidden = false;
+  $("ai-running").hidden = true;
+  $("ai-result").hidden = true;
+  $("ai-stream").textContent = "";
+  $("ai-status").textContent = "initializing…";
+  $("ai-error").hidden = true;
+  $("ai-error").textContent = "";
+  document.querySelectorAll("#ai-phases li").forEach((li) => li.classList.remove("active", "done"));
+  ai.buffer = "";
+}
+
+function aiShowRunning() {
+  $("ai-intro").hidden = true;
+  $("ai-running").hidden = false;
+  $("ai-result").hidden = true;
+}
+
+function aiShowResult(verdict) {
+  $("ai-running").hidden = true;
+  $("ai-result").hidden = false;
+
+  // next candle card
+  const candle = String(verdict.next_candle || "").toLowerCase();
+  const candleEl = $("ai-card-candle");
+  candleEl.classList.remove("green", "red");
+  if (candle === "green" || candle === "red") candleEl.classList.add(candle);
+  $("ai-candle").textContent = candle.toUpperCase() || "—";
+
+  // direction card
+  const dir = String(verdict.direction || "").toLowerCase();
+  const dirEl = $("ai-card-direction");
+  dirEl.classList.remove("bullish", "bearish", "ranging");
+  if (["bullish", "bearish", "ranging"].includes(dir)) dirEl.classList.add(dir);
+  $("ai-direction").textContent = dir.toUpperCase() || "—";
+
+  // confidence
+  const conf = Number(verdict.confidence_pct || 0);
+  $("ai-confidence").textContent = `${conf.toFixed(0)}%`;
+
+  // factors
+  const factorsEl = $("ai-factors");
+  factorsEl.innerHTML = "";
+  (verdict.key_factors || []).forEach((f) => {
+    const li = document.createElement("li");
+    li.textContent = String(f);
+    factorsEl.appendChild(li);
+  });
+
+  // reasoning
+  $("ai-reasoning").textContent = verdict.reasoning_summary || "—";
+}
+
+function aiShowError(msg) {
+  // Either inline in result view (if reached), or as overlay on running
+  $("ai-error").textContent = msg;
+  $("ai-error").hidden = false;
+  // Make sure something is visible
+  if ($("ai-running").hidden && $("ai-result").hidden) {
+    $("ai-result").hidden = false;
+  }
+}
+
+function aiHandleEvent(msg) {
+  if (msg.event === "status") {
+    $("ai-status").textContent = msg.text || msg.phase || "…";
+    if (msg.phase) aiSetPhase(msg.phase);
+  } else if (msg.event === "chunk") {
+    ai.buffer += msg.text || "";
+    const stream = $("ai-stream");
+    stream.textContent = ai.buffer;
+    stream.scrollTop = stream.scrollHeight;
+  } else if (msg.event === "verdict") {
+    aiShowResult(msg.data || {});
+  } else if (msg.event === "error") {
+    aiShowError(msg.message || "AI request failed");
+  } else if (msg.event === "done") {
+    ai.running = false;
+    $("ai-btn").classList.remove("running");
+  } else if (msg.event === "ping") {
+    // keepalive — ignore
+  }
+}
+
+function aiRun() {
+  if (ai.running) return;
+  ai.running = true;
+  ai.buffer = "";
+  $("ai-btn").classList.add("running");
+  $("ai-symbol-display").textContent = symLabel(state.symbol);
+  aiShowRunning();
+  $("ai-status").textContent = "opening connection…";
+
+  if (ai.ws) {
+    try { ai.ws.close(); } catch {}
+    ai.ws = null;
+  }
+  const url = `${WS_PROTO}://${BACKEND}/ws/ai-analysis?token=${encodeURIComponent(state.token)}${symParam()}`;
+  const ws = new WebSocket(url);
+  ai.ws = ws;
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ action: "start" }));
+  };
+  ws.onmessage = (m) => {
+    let msg;
+    try { msg = JSON.parse(m.data); } catch { return; }
+    aiHandleEvent(msg);
+  };
+  ws.onclose = () => {
+    ai.running = false;
+    $("ai-btn").classList.remove("running");
+    if (ai.ws === ws) ai.ws = null;
+  };
+  ws.onerror = () => {
+    aiShowError("WebSocket error — check that the backend is reachable.");
+    ai.running = false;
+    $("ai-btn").classList.remove("running");
+  };
+}
+
+function openAiModal() {
+  aiResetUi();
+  $("ai-modal").hidden = false;
+}
+function closeAiModal() {
+  // If a run is in progress, close the WS so we don't leak it.
+  if (ai.ws) {
+    try { ai.ws.close(); } catch {}
+    ai.ws = null;
+  }
+  ai.running = false;
+  $("ai-btn").classList.remove("running");
+  $("ai-modal").hidden = true;
+}
+
+function initAiUi() {
+  $("ai-btn").onclick = openAiModal;
+  $("ai-run-btn").onclick = aiRun;
+  $("ai-rerun-btn").onclick = () => { aiResetUi(); aiRun(); };
+  document.querySelectorAll("#ai-modal [data-close]").forEach((el) => {
+    el.onclick = closeAiModal;
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("ai-modal").hidden) closeAiModal();
+  });
+}
+
 async function init() {
   state.token = await ensureAuth();
   document.querySelector("header").style.display = "";
@@ -1493,6 +1664,7 @@ async function init() {
 
   initPaperUi();
   connectPaperWs();
+  initAiUi();
 }
 
 init();

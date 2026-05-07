@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from ai_engine import AIAnalyzer, gather_context
 from basis_engine import BasisEngine
 from cvd_engine import CVDEngine, TIMEFRAME_MS
 from divergence import detect_divergences
@@ -37,6 +38,9 @@ if not ACCESS_TOKEN or len(ACCESS_TOKEN) < 24:
     )
 
 COINALYZE_API_KEY = os.environ.get("COINALYZE_API_KEY", "").strip()
+OPENCODE_API_KEY = os.environ.get("OPENCODE_API_KEY", "").strip()
+OPENCODE_BASE_URL = os.environ.get("OPENCODE_BASE_URL", "https://openrouter.ai/api/v1").strip()
+OPENCODE_MODEL = os.environ.get("OPENCODE_MODEL", "moonshotai/kimi-k2").strip()
 
 
 def _check_token(candidate: str | None) -> bool:
@@ -180,6 +184,13 @@ async def lifespan(app: FastAPI):
     paper_eng = PaperEngine(store, _mark_provider)
     app.state.paper = paper_eng
     app.state.tasks[("paper",)] = asyncio.create_task(paper_eng.run())
+
+    # AI analyzer (manual on-demand, no background loop).
+    app.state.ai = AIAnalyzer(OPENCODE_API_KEY, OPENCODE_BASE_URL, OPENCODE_MODEL)
+    if OPENCODE_API_KEY:
+        print(f"[boot] AI analyzer enabled (model={OPENCODE_MODEL})")
+    else:
+        print("[boot] OPENCODE_API_KEY not set — AI analyzer disabled (icon still appears, click shows config message)")
 
     print(f"[boot] all engines running ({len(app.state.tasks)} tasks)")
 
@@ -412,6 +423,61 @@ async def paper_feed(ws: WebSocket, token: str | None = Query(default=None), uid
         pass
     finally:
         eng.off_update(uid, listener)  # type: ignore[arg-type]
+
+
+@app.websocket("/ws/ai-analysis")
+async def ai_analysis_feed(
+    ws: WebSocket,
+    token: str | None = Query(default=None),
+    symbol: str = Query(default=DEFAULT_SYMBOL),
+):
+    if not _check_token(token):
+        await ws.close(code=4401)
+        return
+    sym = (symbol or DEFAULT_SYMBOL).upper()
+    if sym not in SYMBOLS:
+        await ws.close(code=4400)
+        return
+    ai: AIAnalyzer = app.state.ai
+    await ws.accept()
+
+    try:
+        # Wait for the client's "start" command before doing any work.
+        # This pattern lets the client open the socket while the modal is
+        # still showing the intro screen and only kick off the analysis
+        # when the user clicks Run.
+        first = await ws.receive_text()
+        try:
+            msg = json.loads(first)
+        except json.JSONDecodeError:
+            msg = {}
+        if msg.get("action") != "start":
+            await ws.send_text(json.dumps(
+                {"event": "error", "message": "expected first message {action: 'start'}"}
+            ))
+            await ws.close()
+            return
+
+        if not ai.enabled:
+            await ws.send_text(json.dumps({
+                "event": "error",
+                "message": "AI is not configured on the server. Set OPENCODE_API_KEY in backend/.env.",
+            }))
+            await ws.close()
+            return
+
+        ctx = gather_context(app.state, sym)
+        async for event in ai.analyze_stream(sym, ctx):
+            await ws.send_text(json.dumps(event))
+        await ws.close()
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await ws.send_text(json.dumps({"event": "error", "message": str(e)}))
+            await ws.close()
+        except Exception:
+            pass
 
 
 @app.get("/api/gex", dependencies=[Depends(require_auth)])
