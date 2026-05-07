@@ -43,13 +43,11 @@ function showError(msg) {
 }
 
 async function ensureAuth() {
-  let token = localStorage.getItem("ix_token") || "";
-  if (token) {
-    if (await verifyToken(token)) return token;
-    // Stored token failed verification — drop it so we don't keep retrying
-    // a broken value across refreshes.
-    localStorage.removeItem("ix_token");
-  }
+  // If a token is already stored, trust it immediately — no network call on
+  // refresh. The WS connections will close with 4401 if it ever becomes
+  // invalid, and we handle that below. This prevents logout on reload.
+  const stored = localStorage.getItem("ix_token") || "";
+  if (stored) return stored;
 
   return new Promise((resolve) => {
     const overlay = $("auth-overlay");
@@ -147,20 +145,6 @@ const SIG_LABEL = {
   neutral:         { text: "NEUTRAL",          sub: "no setup" },
 };
 
-// Map composite signal -> existing funding-anim animation state. Reuses the
-// squeeze/flush/explosive/neutral CSS animations rather than inventing new ones.
-const ANIM_MAP = {
-  explosive_long:  "squeeze",
-  explosive_short: "flush",
-  breakout_long:   "squeeze",
-  breakout_short:  "flush",
-  pinned:          "neutral",
-  explosive:       "explosive",
-  squeeze:         "squeeze",
-  flush:           "flush",
-  neutral:         "neutral",
-};
-
 function recomputeSignal() {
   const f  = state.lastFundingSig || "neutral";
   const t  = state.lastTakerRegime || "neutral";
@@ -185,11 +169,8 @@ function recomputeSignal() {
   else                       sig = "neutral";
 
   const lbl = SIG_LABEL[sig];
-  const animState = ANIM_MAP[sig] || "neutral";
-  const anim = $("funding-anim");
   const sigBox = $("funding-signal");
-  if (anim && anim.dataset.state !== animState) anim.dataset.state = animState;
-  if (sigBox && sigBox.dataset.state !== sig)   sigBox.dataset.state = sig;
+  if (sigBox && sigBox.dataset.state !== sig) sigBox.dataset.state = sig;
   const txtEl = $("signal-text");
   const subEl = $("signal-sub");
   if (txtEl) txtEl.textContent = lbl.text;
