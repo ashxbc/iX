@@ -8,8 +8,9 @@ const HTTP = location.protocol === "https:" ? "https" : "http";
 const WS_PROTO = location.protocol === "https:" ? "wss" : "ws";
 
 const state = {
-  symbol: "BTCUSDT",
-  timeframe: "5m",
+  symbol: localStorage.getItem("ix_symbol") || "BTCUSDT",
+  timeframe: localStorage.getItem("ix_timeframe") || "5m",
+  capabilities: {},          // per-symbol {spot, gex, heatmap}
   ws: null,
   priceChart: null,
   cvdChart: null,
@@ -23,6 +24,122 @@ const state = {
   takerDivMarker: null,
   token: "",
 };
+
+// Friendly display label for each perp symbol in the dropdown.
+const SYMBOL_LABEL = {
+  BTCUSDT: "BTC", ETHUSDT: "ETH", SOLUSDT: "SOL", HYPEUSDT: "HYPE",
+  ZECUSDT: "ZEC", TONUSDT: "TON", NEARUSDT: "NEAR", ONDOUSDT: "ONDO",
+  ENAUSDT: "ENA", MONUSDT: "MON", MEGAUSDT: "MEGA", OPUSDT: "OP",
+  BNBUSDT: "BNB", XMRUSDT: "XMR",
+};
+
+function symParam() {
+  return `&symbol=${encodeURIComponent(state.symbol)}`;
+}
+
+/* ---------- symbol switching ---------- */
+
+function caps() {
+  return state.capabilities[state.symbol] || { spot: true, gex: true, heatmap: true };
+}
+
+function applyCapabilities() {
+  const c = caps();
+  // Keep the funding-bar grid stable across symbols — show explicit
+  // "unavailable" placeholders for missing data sources rather than
+  // hiding columns and leaving empty grid tracks.
+  const basisStat = $("basis-stat");
+  if (basisStat) {
+    basisStat.classList.toggle("disabled", !c.spot);
+    if (!c.spot) {
+      $("basis-val").textContent = "n/a";
+      $("basis-sub").textContent = "no spot pair";
+    }
+  }
+  const gexStat = $("gex-stat");
+  if (gexStat) {
+    gexStat.classList.toggle("disabled", !c.gex);
+    gexStat.dataset.state = c.gex ? "neutral" : "neutral";
+    if (!c.gex) {
+      $("gex-val").textContent = "n/a";
+      $("gex-sub").textContent = "no options market";
+    }
+  }
+  const liqBtn = $("liq-toggle");
+  if (liqBtn) {
+    liqBtn.disabled = !c.heatmap;
+    liqBtn.title = c.heatmap
+      ? "toggle liquidation heatmap"
+      : "heatmap unavailable for this symbol";
+  }
+}
+
+function resetSymbolViews() {
+  if (state.candleSeries) state.candleSeries.setData([]);
+  if (state.cvdSeries) state.cvdSeries.setData([]);
+  if (state.basisSeries) state.basisSeries.setData([]);
+  if (state.takerAnchorSeries) state.takerAnchorSeries.setData([]);
+  for (const tf of ["5m", "15m", "1h"]) {
+    if (state.takerSeries[tf]) state.takerSeries[tf].setData([]);
+  }
+  // Paper trade lines are only relevant on BTC.
+  for (const id of Object.keys(paper.lines || {})) removeTradeLines(Number(id));
+  // Drop divergence markers from the previous symbol.
+  if (state.candleSeries && state.candleSeries.setMarkers) state.candleSeries.setMarkers([]);
+  // Reset readouts.
+  ["px", "cvd", "delta", "fund-val", "oi-val", "basis-val", "gex-val", "taker-5m", "taker-15m", "taker-1h"].forEach((id) => {
+    const el = $(id);
+    if (el) el.textContent = "—";
+  });
+  const dEl = $("delta"); if (dEl) dEl.style.color = "";
+  if ($("oi-change")) $("oi-change").textContent = "1h —";
+  if ($("fund-countdown")) $("fund-countdown").textContent = "next in —";
+  if ($("basis-sub")) $("basis-sub").textContent = "leader —";
+  if ($("gex-sub")) $("gex-sub").textContent = "flip —";
+  // Composite signal back to neutral.
+  state.lastFundingSig = "neutral";
+  state.lastTakerRegime = "neutral";
+  state.lastGex = null;
+  if (typeof recomputeSignal === "function") recomputeSignal();
+  // Heatmap canvas
+  if (typeof drawHeatmap === "function") {
+    state.liqSnapshot = null;
+    drawHeatmap();
+  }
+}
+
+function closeSymbolWses() {
+  for (const k of ["ws", "fundingWs", "basisWs", "takerWs", "gexWs", "liveLiqWs", "liqWs"]) {
+    const ws = state[k];
+    if (ws) {
+      // Null onclose so the auto-reconnect timer doesn't fire on stale symbol.
+      ws.onclose = null;
+      try { ws.close(); } catch {}
+      state[k] = null;
+    }
+  }
+}
+
+function reconnectAllForSymbol() {
+  const c = caps();
+  connect();             // /ws/{symbol}/{timeframe}
+  connectFunding();
+  if (c.spot) connectBasis();
+  connectTaker();
+  if (c.gex) connectGex();
+  connectLiveLiq();
+  if (state.liqVisible && c.heatmap) connectLiquidations();
+}
+
+function switchSymbol(newSym) {
+  if (!newSym || newSym === state.symbol) return;
+  state.symbol = newSym;
+  localStorage.setItem("ix_symbol", newSym);
+  closeSymbolWses();
+  resetSymbolViews();
+  applyCapabilities();
+  reconnectAllForSymbol();
+}
 
 async function verifyToken(token) {
   if (!token) return false;
@@ -209,7 +326,7 @@ function connectGex() {
     state.gexWs.onclose = null;
     state.gexWs.close();
   }
-  const url = `${WS_PROTO}://${BACKEND}/ws/gex?token=${encodeURIComponent(state.token)}`;
+  const url = `${WS_PROTO}://${BACKEND}/ws/gex?token=${encodeURIComponent(state.token)}${symParam()}`;
   const ws = new WebSocket(url);
   state.gexWs = ws;
   ws.onmessage = (m) => {
@@ -226,7 +343,7 @@ function connectFunding() {
     state.fundingWs.onclose = null;
     state.fundingWs.close();
   }
-  const url = `${WS_PROTO}://${BACKEND}/ws/funding?token=${encodeURIComponent(state.token)}`;
+  const url = `${WS_PROTO}://${BACKEND}/ws/funding?token=${encodeURIComponent(state.token)}${symParam()}`;
   const ws = new WebSocket(url);
   state.fundingWs = ws;
   ws.onmessage = (m) => {
@@ -527,7 +644,7 @@ function connectBasis() {
     state.basisWs.onclose = null;
     state.basisWs.close();
   }
-  const url = `${WS_PROTO}://${BACKEND}/ws/basis?token=${encodeURIComponent(state.token)}`;
+  const url = `${WS_PROTO}://${BACKEND}/ws/basis?token=${encodeURIComponent(state.token)}${symParam()}`;
   const ws = new WebSocket(url);
   state.basisWs = ws;
   ws.onmessage = (m) => {
@@ -636,7 +753,7 @@ function connectTaker() {
     state.takerWs.onclose = null;
     state.takerWs.close();
   }
-  const url = `${WS_PROTO}://${BACKEND}/ws/taker?token=${encodeURIComponent(state.token)}`;
+  const url = `${WS_PROTO}://${BACKEND}/ws/taker?token=${encodeURIComponent(state.token)}${symParam()}`;
   const ws = new WebSocket(url);
   state.takerWs = ws;
   ws.onmessage = (m) => {
@@ -701,7 +818,7 @@ function connectLiveLiq() {
     state.liveLiqWs.onclose = null;
     state.liveLiqWs.close();
   }
-  const url = `${WS_PROTO}://${BACKEND}/ws/live-liq?token=${encodeURIComponent(state.token)}`;
+  const url = `${WS_PROTO}://${BACKEND}/ws/live-liq?token=${encodeURIComponent(state.token)}${symParam()}`;
   const ws = new WebSocket(url);
   state.liveLiqWs = ws;
   ws.onmessage = (m) => {
@@ -919,7 +1036,7 @@ function connectLiquidations() {
     state.liqWs.onclose = null;
     state.liqWs.close();
   }
-  const url = `${WS_PROTO}://${BACKEND}/ws/liquidations?token=${encodeURIComponent(state.token)}`;
+  const url = `${WS_PROTO}://${BACKEND}/ws/liquidations?token=${encodeURIComponent(state.token)}${symParam()}`;
   const ws = new WebSocket(url);
   state.liqWs = ws;
   ws.onmessage = (m) => {
@@ -1305,35 +1422,44 @@ async function init() {
     cache: "no-store",
     credentials: "omit",
   }).then((x) => x.json());
+
+  state.capabilities = r.capabilities || {};
+
+  // Validate the persisted symbol; fall back to server default if it was
+  // removed since last visit.
+  if (!r.symbols.includes(state.symbol)) {
+    state.symbol = r.default || r.symbols[0];
+    localStorage.setItem("ix_symbol", state.symbol);
+  }
+
   const sel = $("symbol");
+  sel.innerHTML = "";
   r.symbols.forEach((s) => {
     const o = document.createElement("option");
-    o.value = s; o.textContent = s;
+    o.value = s;
+    o.textContent = SYMBOL_LABEL[s] || s.replace(/USDT$/, "");
     sel.appendChild(o);
   });
   sel.value = state.symbol;
-  sel.onchange = () => { state.symbol = sel.value; connect(); };
+  sel.onchange = () => switchSymbol(sel.value);
 
   const tfs = $("tfs");
+  tfs.innerHTML = "";
   r.timeframes.forEach((tf) => {
     const b = document.createElement("button");
     b.textContent = tf;
     if (tf === state.timeframe) b.classList.add("active");
     b.onclick = () => {
       state.timeframe = tf;
+      localStorage.setItem("ix_timeframe", tf);
       [...tfs.children].forEach((c) => c.classList.toggle("active", c.textContent === tf));
-      connect();
+      connect();   // timeframe only affects the price/CVD WS
     };
     tfs.appendChild(b);
   });
 
-  connect();
-  connectFunding();
-  connectBasis();
-  connectTaker();
-  connectGex();
-  connectLiveLiq();
-  if (state.liqVisible) connectLiquidations();
+  applyCapabilities();
+  reconnectAllForSymbol();
 
   initPaperUi();
   connectPaperWs();

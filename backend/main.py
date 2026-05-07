@@ -55,7 +55,18 @@ async def require_auth(
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
-SYMBOLS = ["BTCUSDT"]
+SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "HYPEUSDT", "ZECUSDT", "TONUSDT",
+    "NEARUSDT", "ONDOUSDT", "ENAUSDT", "MONUSDT", "MEGAUSDT", "OPUSDT",
+    "BNBUSDT", "XMRUSDT",
+]
+# Coins with no Binance Spot pair — basis (spot vs perp) cannot be computed.
+SYMBOLS_NO_SPOT = {"HYPEUSDT", "MONUSDT", "XMRUSDT"}
+# GEX is only meaningful where a deep options market exists. Deribit lists
+# BTC and ETH (SOL exists but OI is too thin to be reliable). Map perp symbol
+# to Deribit currency code.
+GEX_CURRENCIES = {"BTCUSDT": "BTC", "ETHUSDT": "ETH"}
+DEFAULT_SYMBOL = "BTCUSDT"
 TIMEFRAMES = list(TIMEFRAME_MS.keys())
 
 
@@ -63,89 +74,93 @@ TIMEFRAMES = list(TIMEFRAME_MS.keys())
 async def lifespan(app: FastAPI):
     store = Store()
     app.state.store = store
-    app.state.engines: dict[tuple[str, str], CVDEngine] = {}
-    app.state.tasks: dict[tuple[str, str], asyncio.Task] = {}
 
-    print(f"[boot] starting {len(SYMBOLS) * len(TIMEFRAMES)} CVD engines (24/7)")
+    # All engines indexed by perp symbol. CVD is also keyed by timeframe.
+    app.state.engines: dict[tuple[str, str], CVDEngine] = {}
+    app.state.funding: dict[str, FundingOIEngine] = {}
+    app.state.basis: dict[str, BasisEngine] = {}
+    app.state.live_liq: dict[str, LiveLiquidationEngine] = {}
+    app.state.taker: dict[str, TakerEngine] = {}
+    app.state.gex: dict[str, GexEngine] = {}
+    app.state.liquidation: dict[str, LiquidationEngine] = {}
+    app.state.tasks: dict = {}
+
+    # Construct everything first so we can seed in parallel (14 coins serially
+    # would take 30+ seconds on cold start).
+    seed_coros = []
     for sym in SYMBOLS:
+        # CVD per (symbol, timeframe)
         for tf in TIMEFRAMES:
             eng = CVDEngine(sym, tf, store)
-            await eng.seed_history()
-            key = (sym.lower(), tf)
-            app.state.engines[key] = eng
-            app.state.tasks[key] = asyncio.create_task(eng.run())
+            app.state.engines[(sym.lower(), tf)] = eng
+            seed_coros.append(eng.seed_history())
 
-    # Funding/OI engine (BTC only for now)
-    print("[boot] starting funding/OI engine (BTCUSDT)")
-    fund_eng = FundingOIEngine("BTCUSDT", store)
-    await fund_eng.seed_history()
-    app.state.funding = fund_eng
-    app.state.funding_task = asyncio.create_task(fund_eng.run())
+        # Funding/OI — every USDT-M perp has funding
+        fund_eng = FundingOIEngine(sym, store)
+        app.state.funding[sym] = fund_eng
+        seed_coros.append(fund_eng.seed_history())
 
-    # Basis engine (Spot vs Perp premium, BTC only)
-    print("[boot] starting basis engine (BTCUSDT)")
-    basis_eng = BasisEngine("BTCUSDT", store)
-    await basis_eng.seed_history()
-    app.state.basis = basis_eng
-    app.state.basis_task = asyncio.create_task(basis_eng.run())
+        # Basis — only when a Binance Spot pair exists for this base asset
+        if sym not in SYMBOLS_NO_SPOT:
+            basis_eng = BasisEngine(sym, store)
+            app.state.basis[sym] = basis_eng
+            seed_coros.append(basis_eng.seed_history())
 
-    # Live liquidation feed (Binance Futures forceOrder WS, BTC only)
-    print("[boot] starting live liquidation feed (BTCUSDT)")
-    live_liq = LiveLiquidationEngine("BTCUSDT")
-    app.state.live_liq = live_liq
-    app.state.live_liq_task = asyncio.create_task(live_liq.run())
+        # Live liquidation WS (forceOrder) — exists on every USDT-M perp
+        app.state.live_liq[sym] = LiveLiquidationEngine(sym)
 
-    # Taker buy/sell ratio engine (multi-TF, BTC only)
-    print("[boot] starting taker ratio engine (BTCUSDT, 5m/15m/1h)")
-    taker_eng = TakerEngine("BTCUSDT", store)
-    await taker_eng.seed_history()
-    app.state.taker = taker_eng
-    app.state.taker_task = asyncio.create_task(taker_eng.run())
+        # Taker ratio (kline_5m/15m/1h) — every perp
+        taker_eng = TakerEngine(sym, store)
+        app.state.taker[sym] = taker_eng
+        seed_coros.append(taker_eng.seed_history())
 
-    # Options Gamma Exposure engine (Deribit BTC options, 5min poll)
-    print("[boot] starting GEX engine (Deribit BTC options)")
-    gex_eng = GexEngine("BTCUSDT", store)
-    await gex_eng.seed_history()
-    app.state.gex = gex_eng
-    app.state.gex_task = asyncio.create_task(gex_eng.run())
+        # GEX — only if Deribit lists this currency's options
+        if sym in GEX_CURRENCIES:
+            gex_eng = GexEngine(sym, store, currency=GEX_CURRENCIES[sym])
+            app.state.gex[sym] = gex_eng
+            seed_coros.append(gex_eng.seed_history())
 
-    # Paper trading engine (uses basis perp mid as the live mark)
-    print("[boot] starting paper trading engine")
-    paper_eng = PaperEngine(store, basis_eng)
+        # Coinalyze liquidation heatmap — same ticker pattern across coins;
+        # if Coinalyze doesn't list it, the engine logs and returns empty.
+        if COINALYZE_API_KEY:
+            liq_eng = LiquidationEngine(sym, f"{sym}_PERP.A", COINALYZE_API_KEY, store)
+            app.state.liquidation[sym] = liq_eng
+            seed_coros.append(liq_eng.seed_history())
+
+    print(f"[boot] seeding {len(seed_coros)} engines for {len(SYMBOLS)} symbols (parallel)")
+    await asyncio.gather(*seed_coros, return_exceptions=True)
+
+    # Now spin up the run loops.
+    for (sym, tf), eng in app.state.engines.items():
+        app.state.tasks[("cvd", sym, tf)] = asyncio.create_task(eng.run())
+    for sym, e in app.state.funding.items():
+        app.state.tasks[("funding", sym)] = asyncio.create_task(e.run())
+    for sym, e in app.state.basis.items():
+        app.state.tasks[("basis", sym)] = asyncio.create_task(e.run())
+    for sym, e in app.state.live_liq.items():
+        app.state.tasks[("live_liq", sym)] = asyncio.create_task(e.run())
+    for sym, e in app.state.taker.items():
+        app.state.tasks[("taker", sym)] = asyncio.create_task(e.run())
+    for sym, e in app.state.gex.items():
+        app.state.tasks[("gex", sym)] = asyncio.create_task(e.run())
+    for sym, e in app.state.liquidation.items():
+        app.state.tasks[("liq", sym)] = asyncio.create_task(e.run())
+
+    # Paper trading uses BTC perp mid as the mark (paper trading is BTC-only
+    # by design — keeps the leverage math simple and the demo focused).
+    btc_basis = app.state.basis.get("BTCUSDT")
+    paper_eng = PaperEngine(store, btc_basis)
     app.state.paper = paper_eng
-    app.state.paper_task = asyncio.create_task(paper_eng.run())
+    app.state.tasks[("paper",)] = asyncio.create_task(paper_eng.run())
 
-    # Liquidation heatmap engine (BTC only)
-    app.state.liquidation = None
-    app.state.liquidation_task = None
-    if COINALYZE_API_KEY:
-        print("[boot] starting liquidation engine (BTCUSDT)")
-        liq_eng = LiquidationEngine("BTCUSDT", "BTCUSDT_PERP.A", COINALYZE_API_KEY, store)
-        await liq_eng.seed_history()
-        app.state.liquidation = liq_eng
-        app.state.liquidation_task = asyncio.create_task(liq_eng.run())
-    else:
-        print("[boot] COINALYZE_API_KEY not set — skipping liquidation engine")
-
-    print("[boot] all engines running")
+    print(f"[boot] all engines running ({len(app.state.tasks)} tasks)")
 
     try:
         yield
     finally:
-        extra_tasks = []
-        for attr in ("funding_task", "basis_task", "liquidation_task", "live_liq_task",
-                     "taker_task", "gex_task", "paper_task"):
-            t = getattr(app.state, attr, None)
-            if t is not None:
-                t.cancel()
-                extra_tasks.append(t)
         for t in app.state.tasks.values():
             t.cancel()
-        await asyncio.gather(
-            *app.state.tasks.values(),
-            *extra_tasks,
-            return_exceptions=True,
-        )
+        await asyncio.gather(*app.state.tasks.values(), return_exceptions=True)
         for eng in app.state.engines.values():
             if eng.candles and eng.candles[-1].observed:
                 store.upsert(eng.symbol.upper(), eng.timeframe, eng.candles[-1].to_dict())
@@ -174,6 +189,14 @@ async def _ws_pump(ws: WebSocket, queue: asyncio.Queue):
             continue
         await ws.send_text(json.dumps(msg))
 
+
+def _resolve_engine(d: dict, symbol: str | None, what: str):
+    sym = (symbol or DEFAULT_SYMBOL).upper()
+    eng = d.get(sym)
+    if eng is None:
+        raise HTTPException(status_code=404, detail=f"no {what} for {sym}")
+    return eng, sym
+
 # Allow the frontend served from a different origin (e.g., Vercel) to call us.
 app.add_middleware(
     CORSMiddleware,
@@ -191,13 +214,29 @@ async def auth_check(_: None = Depends(require_auth)):
 
 @app.get("/api/symbols", dependencies=[Depends(require_auth)])
 async def symbols():
-    return {"symbols": SYMBOLS, "timeframes": TIMEFRAMES}
+    # Per-symbol capability map so the frontend knows which panels to show.
+    caps = {
+        sym: {
+            "spot": sym not in SYMBOLS_NO_SPOT,
+            "gex": sym in GEX_CURRENCIES,
+            "heatmap": bool(COINALYZE_API_KEY) and sym in app.state.liquidation,
+        } for sym in SYMBOLS
+    }
+    return {
+        "symbols": SYMBOLS,
+        "default": DEFAULT_SYMBOL,
+        "timeframes": TIMEFRAMES,
+        "capabilities": caps,
+    }
 
 
 @app.get("/api/status", dependencies=[Depends(require_auth)])
-async def status():
+async def status(symbol: str | None = None):
+    target = symbol.upper() if symbol else None
     out = []
     for (sym, tf), eng in app.state.engines.items():
+        if target and sym.upper() != target:
+            continue
         last = eng.candles[-1].to_dict() if eng.candles else None
         observed = sum(1 for c in eng.candles if c.observed)
         out.append({
@@ -212,23 +251,31 @@ async def status():
 
 
 @app.get("/api/funding", dependencies=[Depends(require_auth)])
-async def funding_status():
-    eng: FundingOIEngine = app.state.funding
+async def funding_status(symbol: str = DEFAULT_SYMBOL):
+    eng, _ = _resolve_engine(app.state.funding, symbol, "funding engine")
     return eng.snapshot_history()
 
 
 @app.get("/api/basis", dependencies=[Depends(require_auth)])
-async def basis_status():
-    eng: BasisEngine = app.state.basis
+async def basis_status(symbol: str = DEFAULT_SYMBOL):
+    eng, _ = _resolve_engine(app.state.basis, symbol, "basis engine")
     return eng.snapshot_history()
 
 
 @app.websocket("/ws/basis")
-async def basis_feed(ws: WebSocket, token: str | None = Query(default=None)):
+async def basis_feed(
+    ws: WebSocket,
+    token: str | None = Query(default=None),
+    symbol: str = Query(default=DEFAULT_SYMBOL),
+):
     if not _check_token(token):
         await ws.close(code=4401)
         return
-    eng: BasisEngine = app.state.basis
+    sym = (symbol or DEFAULT_SYMBOL).upper()
+    eng = app.state.basis.get(sym)
+    if eng is None:
+        await ws.close(code=4404)
+        return
     await ws.accept()
     queue: asyncio.Queue = asyncio.Queue(maxsize=400)
 
@@ -336,18 +383,28 @@ async def paper_feed(ws: WebSocket, token: str | None = Query(default=None), uid
 
 
 @app.get("/api/gex", dependencies=[Depends(require_auth)])
-async def gex_status():
-    eng: GexEngine = app.state.gex
-    snap = eng.snapshot()
-    return {"snapshot": snap}
+async def gex_status(symbol: str = DEFAULT_SYMBOL):
+    sym = (symbol or DEFAULT_SYMBOL).upper()
+    eng = app.state.gex.get(sym)
+    if eng is None:
+        return {"available": False, "snapshot": None, "symbol": sym}
+    return {"available": True, "snapshot": eng.snapshot(), "symbol": sym}
 
 
 @app.websocket("/ws/gex")
-async def gex_feed(ws: WebSocket, token: str | None = Query(default=None)):
+async def gex_feed(
+    ws: WebSocket,
+    token: str | None = Query(default=None),
+    symbol: str = Query(default=DEFAULT_SYMBOL),
+):
     if not _check_token(token):
         await ws.close(code=4401)
         return
-    eng: GexEngine = app.state.gex
+    sym = (symbol or DEFAULT_SYMBOL).upper()
+    eng = app.state.gex.get(sym)
+    if eng is None:
+        await ws.close(code=4404)
+        return
     await ws.accept()
     queue: asyncio.Queue = asyncio.Queue(maxsize=50)
 
@@ -370,17 +427,25 @@ async def gex_feed(ws: WebSocket, token: str | None = Query(default=None)):
 
 
 @app.get("/api/taker", dependencies=[Depends(require_auth)])
-async def taker_status():
-    eng: TakerEngine = app.state.taker
+async def taker_status(symbol: str = DEFAULT_SYMBOL):
+    eng, _ = _resolve_engine(app.state.taker, symbol, "taker engine")
     return eng.snapshot_history()
 
 
 @app.websocket("/ws/taker")
-async def taker_feed(ws: WebSocket, token: str | None = Query(default=None)):
+async def taker_feed(
+    ws: WebSocket,
+    token: str | None = Query(default=None),
+    symbol: str = Query(default=DEFAULT_SYMBOL),
+):
     if not _check_token(token):
         await ws.close(code=4401)
         return
-    eng: TakerEngine = app.state.taker
+    sym = (symbol or DEFAULT_SYMBOL).upper()
+    eng = app.state.taker.get(sym)
+    if eng is None:
+        await ws.close(code=4404)
+        return
     await ws.accept()
     queue: asyncio.Queue = asyncio.Queue(maxsize=400)
 
@@ -401,11 +466,19 @@ async def taker_feed(ws: WebSocket, token: str | None = Query(default=None)):
 
 
 @app.websocket("/ws/live-liq")
-async def live_liq_feed(ws: WebSocket, token: str | None = Query(default=None)):
+async def live_liq_feed(
+    ws: WebSocket,
+    token: str | None = Query(default=None),
+    symbol: str = Query(default=DEFAULT_SYMBOL),
+):
     if not _check_token(token):
         await ws.close(code=4401)
         return
-    eng: LiveLiquidationEngine = app.state.live_liq
+    sym = (symbol or DEFAULT_SYMBOL).upper()
+    eng = app.state.live_liq.get(sym)
+    if eng is None:
+        await ws.close(code=4404)
+        return
     await ws.accept()
     queue: asyncio.Queue = asyncio.Queue(maxsize=200)
 
@@ -425,19 +498,25 @@ async def live_liq_feed(ws: WebSocket, token: str | None = Query(default=None)):
 
 
 @app.get("/api/liquidations", dependencies=[Depends(require_auth)])
-async def liquidations_status():
-    eng: LiquidationEngine | None = app.state.liquidation
+async def liquidations_status(symbol: str = DEFAULT_SYMBOL):
+    sym = (symbol or DEFAULT_SYMBOL).upper()
+    eng = app.state.liquidation.get(sym)
     if eng is None:
-        return {"enabled": False, "snapshot": None}
-    return {"enabled": True, "snapshot": eng.snapshot()}
+        return {"enabled": False, "snapshot": None, "symbol": sym}
+    return {"enabled": True, "snapshot": eng.snapshot(), "symbol": sym}
 
 
 @app.websocket("/ws/liquidations")
-async def liquidations_feed(ws: WebSocket, token: str | None = Query(default=None)):
+async def liquidations_feed(
+    ws: WebSocket,
+    token: str | None = Query(default=None),
+    symbol: str = Query(default=DEFAULT_SYMBOL),
+):
     if not _check_token(token):
         await ws.close(code=4401)
         return
-    eng: LiquidationEngine | None = app.state.liquidation
+    sym = (symbol or DEFAULT_SYMBOL).upper()
+    eng = app.state.liquidation.get(sym)
     if eng is None:
         await ws.close(code=4404)
         return
@@ -461,12 +540,20 @@ async def liquidations_feed(ws: WebSocket, token: str | None = Query(default=Non
 
 
 @app.websocket("/ws/funding")
-async def funding_feed(ws: WebSocket, token: str | None = Query(default=None)):
+async def funding_feed(
+    ws: WebSocket,
+    token: str | None = Query(default=None),
+    symbol: str = Query(default=DEFAULT_SYMBOL),
+):
     if not _check_token(token):
         await ws.close(code=4401)
         return
+    sym = (symbol or DEFAULT_SYMBOL).upper()
+    eng = app.state.funding.get(sym)
+    if eng is None:
+        await ws.close(code=4404)
+        return
     await ws.accept()
-    eng: FundingOIEngine = app.state.funding
     queue: asyncio.Queue = asyncio.Queue(maxsize=200)
 
     async def listener(event: str, payload: dict):

@@ -52,17 +52,18 @@ DERIBIT_URL = "https://www.deribit.com/api/v2/public/get_book_summary_by_currenc
 POLL_INTERVAL_SEC = 300        # 5 minutes
 MAX_DAYS_TO_EXPIRY = 14
 STRIKE_RANGE_PCT = 0.15
-CONTRACT_SIZE = 1.0            # Deribit BTC option = 1 BTC
+CONTRACT_SIZE = 1.0            # Deribit BTC/ETH option = 1 underlying
 
-INSTRUMENT_RE = re.compile(r"^BTC-(\d{1,2})([A-Z]{3})(\d{2})-(\d+)-([CP])$")
+# Deribit supports BTC, ETH, SOL options. Pattern: "<CCY>-<DDMMMYY>-<strike>-<C|P>"
 MONTHS = {
     "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
     "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
 }
 
 
-def _parse_instrument(name: str):
-    m = INSTRUMENT_RE.match(name)
+def _parse_instrument(name: str, currency: str):
+    pattern = re.compile(rf"^{currency}-(\d{{1,2}})([A-Z]{{3}})(\d{{2}})-(\d+)-([CP])$")
+    m = pattern.match(name)
     if not m:
         return None
     day, mon, yr, strike, side = m.groups()
@@ -86,8 +87,9 @@ def _bs_gamma(S: float, K: float, T_years: float, sigma: float) -> float:
 
 
 class GexEngine:
-    def __init__(self, symbol: str, store: Store):
+    def __init__(self, symbol: str, store: Store, currency: str = "BTC"):
         self.symbol = symbol.upper()
+        self.currency = currency.upper()    # Deribit currency: "BTC" / "ETH"
         self.store = store
         self._listeners: list[Callable] = []
         self._running = False
@@ -136,7 +138,7 @@ class GexEngine:
 
     async def _poll(self):
         async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.get(DERIBIT_URL, params={"currency": "BTC", "kind": "option"})
+            r = await c.get(DERIBIT_URL, params={"currency": self.currency, "kind": "option"})
             r.raise_for_status()
             data = r.json()
         rows = data.get("result", []) or []
@@ -163,7 +165,7 @@ class GexEngine:
         )
 
         for row in rows:
-            inst = _parse_instrument(row.get("instrument_name", ""))
+            inst = _parse_instrument(row.get("instrument_name", ""), self.currency)
             if not inst:
                 continue
             T = (inst["expiry"] - now).total_seconds() / (365.0 * 86400.0)
@@ -261,7 +263,7 @@ class GexEngine:
         )
         await self._emit("tick", snap)
         flip_str = f"{flip_zone:.0f}" if flip_zone else "—"
-        print(f"[gex] spot={spot:.0f} flip={flip_str} state={state} "
+        print(f"[gex {self.currency}] spot={spot:.2f} flip={flip_str} state={state} "
               f"net={net_total:.2e} strikes={len(out)}")
 
     # ---------- snapshot ----------

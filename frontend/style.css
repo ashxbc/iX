@@ -407,6 +407,11 @@ main {
 #gex-stat[data-state="explosive"] .stat-val { color: #f5b942; }
 #gex-stat[data-state="neutral"]   .stat-val { color: var(--mute); }
 
+/* Stat column disabled state (data source unavailable for current symbol) */
+.funding-stat.disabled .stat-val { color: var(--mute); opacity: 0.55; }
+.funding-stat.disabled .stat-sub { opacity: 0.55; }
+.icon-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
 /* ============================================================
    Paper trading modal
    ============================================================ */
