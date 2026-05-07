@@ -43,14 +43,19 @@ function showError(msg) {
 }
 
 async function ensureAuth() {
-  // If a token is already stored, trust it immediately — no network call on
-  // refresh. The WS connections will close with 4401 if it ever becomes
-  // invalid, and we handle that below. This prevents logout on reload.
+  const overlay = $("auth-overlay");
+  const hideOverlay = () => { if (overlay) overlay.style.display = "none"; };
+
+  // If a token is already stored, trust it immediately and hide the overlay.
+  // No network call on refresh. WS connections will close with 4401 if the
+  // token is bad, and reconnect logic re-tries — never auto-logging out.
   const stored = localStorage.getItem("ix_token") || "";
-  if (stored) return stored;
+  if (stored) {
+    hideOverlay();
+    return stored;
+  }
 
   return new Promise((resolve) => {
-    const overlay = $("auth-overlay");
     const form = $("auth-form");
     const input = $("auth-input");
     overlay.style.display = "flex";
@@ -62,7 +67,7 @@ async function ensureAuth() {
       if (!t) return;
       if (await verifyToken(t)) {
         localStorage.setItem("ix_token", t);
-        overlay.style.display = "none";
+        hideOverlay();
         resolve(t);
       } else {
         showError("invalid token");

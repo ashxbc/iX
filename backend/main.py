@@ -153,6 +153,27 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+
+# ---------------------------------------------------------------------------
+# WS keepalive: nginx (and most reverse proxies) close idle WebSocket
+# connections after ~60s. Engines that emit infrequently (GEX = 5min) silently
+# die between pushes. This pump sends a small {"event":"ping"} every 25s when
+# the queue is quiet so the connection stays warm. Frontend ignores unknown
+# events, so ping requires no client changes.
+# ---------------------------------------------------------------------------
+WS_KEEPALIVE_SEC = 25.0
+_WS_PING = json.dumps({"event": "ping"})
+
+
+async def _ws_pump(ws: WebSocket, queue: asyncio.Queue):
+    while True:
+        try:
+            msg = await asyncio.wait_for(queue.get(), timeout=WS_KEEPALIVE_SEC)
+        except asyncio.TimeoutError:
+            await ws.send_text(_WS_PING)
+            continue
+        await ws.send_text(json.dumps(msg))
+
 # Allow the frontend served from a different origin (e.g., Vercel) to call us.
 app.add_middleware(
     CORSMiddleware,
@@ -220,9 +241,7 @@ async def basis_feed(ws: WebSocket, token: str | None = Query(default=None)):
     eng.on_update(listener)
     try:
         await ws.send_text(json.dumps({"event": "snapshot", "data": eng.snapshot_history()}))
-        while True:
-            msg = await queue.get()
-            await ws.send_text(json.dumps(msg))
+        await _ws_pump(ws, queue)
     except WebSocketDisconnect:
         pass
     finally:
@@ -309,9 +328,7 @@ async def paper_feed(ws: WebSocket, token: str | None = Query(default=None), uid
     eng.on_update(uid, listener)  # type: ignore[arg-type]
     try:
         await ws.send_text(json.dumps({"event": "snapshot", "data": eng.account_snapshot(uid)}))  # type: ignore[arg-type]
-        while True:
-            msg = await queue.get()
-            await ws.send_text(json.dumps(msg))
+        await _ws_pump(ws, queue)
     except WebSocketDisconnect:
         pass
     finally:
@@ -345,9 +362,7 @@ async def gex_feed(ws: WebSocket, token: str | None = Query(default=None)):
         snap = eng.snapshot()
         if snap is not None:
             await ws.send_text(json.dumps({"event": "snapshot", "data": snap}))
-        while True:
-            msg = await queue.get()
-            await ws.send_text(json.dumps(msg))
+        await _ws_pump(ws, queue)
     except WebSocketDisconnect:
         pass
     finally:
@@ -378,9 +393,7 @@ async def taker_feed(ws: WebSocket, token: str | None = Query(default=None)):
     eng.on_update(listener)
     try:
         await ws.send_text(json.dumps({"event": "snapshot", "data": eng.snapshot_history()}))
-        while True:
-            msg = await queue.get()
-            await ws.send_text(json.dumps(msg))
+        await _ws_pump(ws, queue)
     except WebSocketDisconnect:
         pass
     finally:
@@ -404,9 +417,7 @@ async def live_liq_feed(ws: WebSocket, token: str | None = Query(default=None)):
 
     eng.on_update(listener)
     try:
-        while True:
-            msg = await queue.get()
-            await ws.send_text(json.dumps(msg))
+        await _ws_pump(ws, queue)
     except WebSocketDisconnect:
         pass
     finally:
@@ -442,9 +453,7 @@ async def liquidations_feed(ws: WebSocket, token: str | None = Query(default=Non
     eng.on_update(listener)
     try:
         await ws.send_text(json.dumps({"event": "snapshot", "data": eng.snapshot()}))
-        while True:
-            msg = await queue.get()
-            await ws.send_text(json.dumps(msg))
+        await _ws_pump(ws, queue)
     except WebSocketDisconnect:
         pass
     finally:
@@ -469,9 +478,7 @@ async def funding_feed(ws: WebSocket, token: str | None = Query(default=None)):
     eng.on_update(listener)
     try:
         await ws.send_text(json.dumps({"event": "snapshot", "data": eng.snapshot_history()}))
-        while True:
-            msg = await queue.get()
-            await ws.send_text(json.dumps(msg))
+        await _ws_pump(ws, queue)
     except WebSocketDisconnect:
         pass
     finally:
@@ -508,8 +515,14 @@ async def feed(ws: WebSocket, symbol: str, timeframe: str, token: str | None = Q
         divs = detect_divergences(snap)
         await ws.send_text(json.dumps({"event": "snapshot", "data": {"candles": snap, "divergences": divs}}))
 
+        # Inline pump (with keepalive) so we can run divergence detection on
+        # closed-candle events without forking the helper.
         while True:
-            msg = await queue.get()
+            try:
+                msg = await asyncio.wait_for(queue.get(), timeout=WS_KEEPALIVE_SEC)
+            except asyncio.TimeoutError:
+                await ws.send_text(_WS_PING)
+                continue
             await ws.send_text(json.dumps(msg))
             if msg["event"] == "candle":
                 divs = detect_divergences(engine.snapshot())
