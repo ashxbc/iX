@@ -246,17 +246,30 @@ function buildCharts() {
     autoScale: true,
   });
 
-  // Sync time scales between panes by ACTUAL time (not logical bar index) so
-  // panes with different bar densities (taker 1h vs price 1m/5m) stay aligned
-  // even at the right edge. Guarded to prevent feedback loops.
+  // Hidden anchor series on the taker pane: an invisible line populated with
+  // every price-candle timestamp. This forces the taker chart's time grid to
+  // match the price chart's logical bar index exactly — without it, sparse
+  // 1h bars would make logical-range sync blow up the scale.
+  state.takerAnchorSeries = state.takerChart.addLineSeries({
+    color: "rgba(0,0,0,0)",
+    priceScaleId: "anchor",
+    lastValueVisible: false,
+    priceLineVisible: false,
+    crosshairMarkerVisible: false,
+  });
+  state.takerChart.priceScale("anchor").applyOptions({ visible: false });
+
+  // Sync time scales between panes by LOGICAL bar index. Works because every
+  // pane shares the same time grid (price candles → cvd whitespace fill,
+  // taker anchor series). Guarded to prevent feedback loops.
   const charts = [state.priceChart, state.cvdChart, state.takerChart];
   let syncing = false;
-  const broadcast = (src) => src.timeScale().subscribeVisibleTimeRangeChange((r) => {
+  const broadcast = (src) => src.timeScale().subscribeVisibleLogicalRangeChange((r) => {
     if (!r || syncing) return;
     syncing = true;
     try {
       for (const c of charts) {
-        if (c !== src) c.timeScale().setVisibleRange(r);
+        if (c !== src) c.timeScale().setVisibleLogicalRange(r);
       }
     } finally { syncing = false; }
   });
@@ -306,6 +319,10 @@ function applySnapshot(candles, divergences) {
   });
   state.candleSeries.setData(cs);
   state.cvdSeries.setData(ds);
+  // Anchor the taker pane to the same time grid so logical-range sync works.
+  if (state.takerAnchorSeries) {
+    state.takerAnchorSeries.setData(cs.map((c) => ({ time: c.time })));
+  }
   applyDivergences(divergences || []);
 }
 
@@ -326,6 +343,8 @@ function applyTick(c) {
   // Keep CVD time index aligned with price: emit whitespace when not observed,
   // a real value once a trade has been seen.
   state.cvdSeries.update(c.observed ? { time: t, value: c.cvd } : { time: t });
+  // Extend the taker pane's time grid in lockstep with price.
+  if (state.takerAnchorSeries) state.takerAnchorSeries.update({ time: t });
   state.lastPrice = c.close;
   $("px").textContent = fmt(c.close);
   $("cvd").textContent = fmt(c.cvd, 0);
