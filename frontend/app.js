@@ -931,6 +931,361 @@ function connectLiquidations() {
   ws.onerror = () => {};
 }
 
+/* ============================================================
+   Paper trading
+   ============================================================ */
+
+function getPaperUid() {
+  let uid = localStorage.getItem("ix_paper_uid");
+  if (uid && uid.length >= 8) return uid;
+  // crypto.randomUUID() yields a 36-char dashed UUID — passes our regex.
+  uid = (crypto.randomUUID && crypto.randomUUID()) ||
+        (Date.now().toString(36) + Math.random().toString(36).slice(2, 14));
+  localStorage.setItem("ix_paper_uid", uid);
+  return uid;
+}
+
+const paper = {
+  uid: null,
+  ws: null,
+  side: "long",
+  size: 100,
+  leverage: 10,
+  account: null,         // last snapshot from server
+  history: [],           // closed trades (and open, but rendered separately)
+  lines: {},             // tradeId -> [entryLine, liqLine]
+  lastBalance: null,     // for color flash on change
+};
+
+function fmtUsdSigned(v) {
+  if (v == null || Number.isNaN(v)) return "—";
+  const s = v >= 0 ? "+" : "−";
+  return `${s}$${Math.abs(v).toFixed(2)}`;
+}
+function fmtUsd2(v) {
+  if (v == null || Number.isNaN(v)) return "—";
+  return `$${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+function fmtPriceK(p) {
+  if (!p) return "—";
+  return `$${(p / 1000).toFixed(2)}k`;
+}
+
+function paperHeaders() {
+  return { "X-Auth-Token": state.token, "Content-Type": "application/json" };
+}
+
+async function paperPost(path, body) {
+  const r = await fetch(`${HTTP}://${BACKEND}${path}`, {
+    method: "POST",
+    headers: paperHeaders(),
+    body: JSON.stringify(body),
+    credentials: "omit",
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.detail || `error ${r.status}`);
+  return data;
+}
+
+async function paperGet(path) {
+  const r = await fetch(`${HTTP}://${BACKEND}${path}`, {
+    headers: paperHeaders(), cache: "no-store", credentials: "omit",
+  });
+  if (!r.ok) throw new Error(`error ${r.status}`);
+  return r.json();
+}
+
+function setBalance(v) {
+  const el = $("balance");
+  if (!el) return;
+  el.textContent = fmtUsd2(v);
+  if (paper.lastBalance != null && Math.abs(v - paper.lastBalance) > 0.01) {
+    el.classList.remove("up", "down");
+    void el.offsetWidth;  // restart transition
+    el.classList.add(v >= paper.lastBalance ? "up" : "down");
+    setTimeout(() => el.classList.remove("up", "down"), 1500);
+  }
+  paper.lastBalance = v;
+}
+
+function liqPriceFor(side, mark, lev) {
+  const mm = 0.005;
+  if (!mark || !lev) return null;
+  return side === "long"
+    ? mark * (1 - 1 / lev + mm)
+    : mark * (1 + 1 / lev - mm);
+}
+
+function updateTradePreview() {
+  const size = Math.max(0, Number($("trade-size").value || 0));
+  const lev  = Number($("trade-leverage").value || 1);
+  const mark = paper.account?.mark || state.lastPrice || 0;
+  const margin = lev > 0 ? size / lev : 0;
+  $("lev-display").textContent = `${lev}x`;
+  $("trade-margin").textContent = fmtUsd2(margin);
+  $("trade-notional").textContent = fmtUsd2(size);
+  $("trade-mark").textContent = mark ? fmtUsd2(mark) : "—";
+  const liq = liqPriceFor(paper.side, mark, lev);
+  $("trade-liq").textContent = liq ? fmtUsd2(liq) : "—";
+  const btn = $("open-trade-btn");
+  btn.classList.toggle("short", paper.side === "short");
+  btn.textContent = `OPEN ${paper.side.toUpperCase()}`;
+}
+
+function setSide(side) {
+  paper.side = side;
+  document.querySelectorAll(".side-btn").forEach((b) => {
+    b.classList.toggle("active", b.dataset.side === side);
+  });
+  updateTradePreview();
+}
+
+/* ----- chart price lines per open trade ----- */
+
+function addTradeLines(t) {
+  if (!state.candleSeries) return;
+  if (paper.lines[t.id]) return;  // already drawn
+  const sideColor = t.side === "long" ? "#26a69a" : "#ef5350";
+  const entry = state.candleSeries.createPriceLine({
+    price: t.entry_price,
+    color: sideColor,
+    lineWidth: 2,
+    lineStyle: 0,
+    axisLabelVisible: true,
+    title: `${t.side === "long" ? "L" : "S"}${t.leverage}x #${t.id}`,
+  });
+  const liq = state.candleSeries.createPriceLine({
+    price: t.liq_price,
+    color: "#ef5350",
+    lineWidth: 1,
+    lineStyle: 2,    // dashed
+    axisLabelVisible: true,
+    title: `LIQ #${t.id}`,
+  });
+  paper.lines[t.id] = [entry, liq];
+}
+
+function removeTradeLines(tradeId) {
+  const lines = paper.lines[tradeId];
+  if (!lines || !state.candleSeries) return;
+  lines.forEach((l) => {
+    try { state.candleSeries.removePriceLine(l); } catch {}
+  });
+  delete paper.lines[tradeId];
+}
+
+function syncTradeLines(openTrades) {
+  const wanted = new Set(openTrades.map((t) => t.id));
+  // Remove lines for trades no longer open
+  for (const id of Object.keys(paper.lines)) {
+    if (!wanted.has(Number(id))) removeTradeLines(Number(id));
+  }
+  // Add lines for new ones
+  for (const t of openTrades) addTradeLines(t);
+}
+
+/* ----- rendering ----- */
+
+function applyPaperAccount(snap) {
+  if (!snap) return;
+  paper.account = snap;
+  setBalance(snap.balance);
+  // header badge for open count
+  const cnt = snap.open_trades?.length || 0;
+  const badge = $("open-pos-count");
+  if (badge) {
+    if (cnt > 0) { badge.hidden = false; badge.textContent = cnt; }
+    else { badge.hidden = true; }
+  }
+  // modal equity strip
+  $("modal-balance").textContent = fmtUsd2(snap.balance);
+  $("modal-equity").textContent  = fmtUsd2(snap.equity);
+  const unr = $("modal-unrealized");
+  unr.textContent = fmtUsdSigned(snap.unrealized);
+  unr.classList.toggle("up", snap.unrealized > 0);
+  unr.classList.toggle("down", snap.unrealized < 0);
+  // chart lines
+  syncTradeLines(snap.open_trades || []);
+  // active positions table
+  renderActiveTrades(snap.open_trades || []);
+  // refresh preview liq with fresh mark
+  updateTradePreview();
+  $("active-count").textContent = `(${cnt})`;
+}
+
+function renderActiveTrades(opens) {
+  const wrap = $("active-trades");
+  if (!wrap) return;
+  wrap.innerHTML = "";
+  for (const t of opens) {
+    const row = document.createElement("div");
+    row.className = "trade-row";
+    const pnlCls = t.unrealized_pnl >= 0 ? "up" : "down";
+    const pnlPct = (t.unrealized_pnl / t.margin) * 100;
+    row.innerHTML = `
+      <div class="col-side ${t.side}">${t.side.toUpperCase()}</div>
+      <div class="col-lev">${t.leverage}x</div>
+      <div>${fmtUsd2(t.entry_price)}</div>
+      <div class="col-pnl ${pnlCls}">${fmtUsdSigned(t.unrealized_pnl)} <span class="col-lev">(${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%)</span></div>
+      <div class="col-meta">
+        <span>size ${fmtUsd2(t.size_usd)}</span>
+        <span>margin ${fmtUsd2(t.margin)}</span>
+        <span>liq ${fmtUsd2(t.liq_price)}</span>
+      </div>
+      <button class="close-btn" data-close="${t.id}">close</button>
+    `;
+    wrap.appendChild(row);
+  }
+  wrap.querySelectorAll("[data-close]").forEach((b) => {
+    b.onclick = () => closeTrade(Number(b.dataset.close));
+  });
+}
+
+function renderHistory(trades) {
+  const wrap = $("trade-history");
+  if (!wrap) return;
+  // Only show closed/liquidated/cancelled
+  const past = trades.filter((t) => t.status !== "open").slice(0, 50);
+  wrap.innerHTML = "";
+  for (const t of past) {
+    const row = document.createElement("div");
+    row.className = "trade-row compact";
+    const pnlCls = (t.pnl_usd || 0) >= 0 ? "up" : "down";
+    const date = t.close_ts ? new Date(t.close_ts).toLocaleString() : "—";
+    row.innerHTML = `
+      <div class="col-side ${t.side}">${t.side.toUpperCase()}</div>
+      <div class="col-lev">${t.leverage}x</div>
+      <div>${fmtUsd2(t.entry_price)} → ${t.close_price ? fmtUsd2(t.close_price) : "—"}</div>
+      <div class="col-pnl ${pnlCls}">${fmtUsdSigned(t.pnl_usd)}</div>
+      <div class="col-meta">
+        <span>size ${fmtUsd2(t.size_usd)}</span>
+        <span>${date}</span>
+      </div>
+      <div class="col-status ${t.status}">${t.status}</div>
+    `;
+    wrap.appendChild(row);
+  }
+}
+
+/* ----- actions ----- */
+
+function clearTradeError() { $("trade-error").textContent = ""; }
+function showTradeError(msg) { $("trade-error").textContent = msg; }
+
+async function openTrade() {
+  clearTradeError();
+  const size = Number($("trade-size").value || 0);
+  const lev  = Number($("trade-leverage").value || 1);
+  if (size < 1) return showTradeError("size must be ≥ $1");
+  const btn = $("open-trade-btn");
+  btn.disabled = true;
+  try {
+    const res = await paperPost("/api/paper/open", {
+      uid: paper.uid, side: paper.side, size_usd: size, leverage: lev,
+    });
+    applyPaperAccount(res.account);
+    await refreshHistory();
+  } catch (e) {
+    showTradeError(e.message || "failed to open");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function closeTrade(tradeId) {
+  try {
+    const res = await paperPost("/api/paper/close", {
+      uid: paper.uid, trade_id: tradeId,
+    });
+    applyPaperAccount(res.account);
+    await refreshHistory();
+  } catch (e) {
+    showTradeError(e.message || "failed to close");
+  }
+}
+
+async function resetAccount() {
+  if (!confirm("Reset account to $1000? All open positions will be cancelled.")) return;
+  try {
+    const res = await paperPost("/api/paper/reset", { uid: paper.uid });
+    applyPaperAccount(res.account);
+    await refreshHistory();
+  } catch (e) {
+    showTradeError(e.message || "failed to reset");
+  }
+}
+
+async function refreshHistory() {
+  try {
+    const res = await paperGet(`/api/paper/trades?uid=${encodeURIComponent(paper.uid)}&limit=100`);
+    paper.history = res.trades || [];
+    renderHistory(paper.history);
+  } catch {}
+}
+
+/* ----- modal control ----- */
+
+function openTradesModal() {
+  $("trades-modal").hidden = false;
+  refreshHistory();
+}
+function closeTradesModal() {
+  $("trades-modal").hidden = true;
+}
+
+/* ----- WS ----- */
+
+function connectPaperWs() {
+  if (paper.ws) {
+    paper.ws.onclose = null;
+    paper.ws.close();
+  }
+  const url = `${WS_PROTO}://${BACKEND}/ws/paper?token=${encodeURIComponent(state.token)}&uid=${encodeURIComponent(paper.uid)}`;
+  const ws = new WebSocket(url);
+  paper.ws = ws;
+  ws.onmessage = (m) => {
+    let msg;
+    try { msg = JSON.parse(m.data); } catch { return; }
+    if (msg.event === "snapshot" || msg.event === "tick") {
+      applyPaperAccount(msg.data);
+    } else if (msg.event === "liquidated") {
+      // Force a fresh history pull so the row appears in the closed list,
+      // and let the next snapshot strip the lines via syncTradeLines.
+      refreshHistory();
+    }
+  };
+  ws.onclose = () => setTimeout(connectPaperWs, 2000);
+}
+
+function initPaperUi() {
+  paper.uid = getPaperUid();
+
+  // Header button
+  $("my-trades-btn").onclick = openTradesModal;
+
+  // Modal close handlers
+  document.querySelectorAll("#trades-modal [data-close]").forEach((el) => {
+    el.onclick = closeTradesModal;
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("trades-modal").hidden) closeTradesModal();
+  });
+
+  // Side toggle
+  document.querySelectorAll(".side-btn").forEach((b) => {
+    b.onclick = () => setSide(b.dataset.side);
+  });
+
+  // Form inputs
+  $("trade-size").oninput = updateTradePreview;
+  $("trade-leverage").oninput = updateTradePreview;
+  $("open-trade-btn").onclick = openTrade;
+  $("reset-account").onclick = resetAccount;
+
+  // Initial preview render
+  updateTradePreview();
+}
+
 async function init() {
   state.token = await ensureAuth();
   document.querySelector("header").style.display = "";
@@ -974,6 +1329,9 @@ async function init() {
   connectGex();
   connectLiveLiq();
   if (state.liqVisible) connectLiquidations();
+
+  initPaperUi();
+  connectPaperWs();
 }
 
 init();

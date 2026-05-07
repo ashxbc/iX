@@ -68,6 +68,30 @@ CREATE TABLE IF NOT EXISTS basis (
 );
 CREATE INDEX IF NOT EXISTS idx_basis_s ON basis(symbol, ts DESC);
 
+CREATE TABLE IF NOT EXISTS paper_accounts (
+    user_id TEXT PRIMARY KEY,
+    balance REAL NOT NULL,
+    created_ts INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    side TEXT NOT NULL,
+    entry_price REAL NOT NULL,
+    size_usd REAL NOT NULL,
+    leverage REAL NOT NULL,
+    margin REAL NOT NULL,
+    liq_price REAL NOT NULL,
+    status TEXT NOT NULL,
+    entry_ts INTEGER NOT NULL,
+    close_price REAL,
+    close_ts INTEGER,
+    pnl_usd REAL
+);
+CREATE INDEX IF NOT EXISTS idx_paper_uid_status ON paper_trades(user_id, status, entry_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_paper_status ON paper_trades(status);
+
 CREATE TABLE IF NOT EXISTS gex_snapshots (
     symbol TEXT NOT NULL,
     ts INTEGER NOT NULL,
@@ -241,6 +265,111 @@ class Store:
             {"ts": r[0], "spot": r[1], "perp": r[2], "basis": r[3], "basis_pct": r[4]}
             for r in rows
         ]
+
+    # ---------- paper trading ----------
+
+    def get_or_create_paper_account(self, user_id: str, default_balance: float) -> dict:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT user_id, balance, created_ts FROM paper_accounts WHERE user_id=?",
+                (user_id,),
+            ).fetchone()
+            if row:
+                return {"user_id": row[0], "balance": row[1], "created_ts": row[2]}
+            import time as _t
+            ts = int(_t.time())
+            self._conn.execute(
+                "INSERT INTO paper_accounts (user_id, balance, created_ts) VALUES (?,?,?)",
+                (user_id, default_balance, ts),
+            )
+            self._conn.commit()
+            return {"user_id": user_id, "balance": default_balance, "created_ts": ts}
+
+    def update_paper_balance(self, user_id: str, new_balance: float):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE paper_accounts SET balance=? WHERE user_id=?",
+                (new_balance, user_id),
+            )
+            self._conn.commit()
+
+    def insert_paper_trade(self, user_id: str, side: str, entry_price: float, size_usd: float,
+                            leverage: float, margin: float, liq_price: float, ts_ms: int) -> dict:
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO paper_trades
+                (user_id, side, entry_price, size_usd, leverage, margin, liq_price, status, entry_ts)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (user_id, side, entry_price, size_usd, leverage, margin, liq_price, "open", ts_ms),
+            )
+            self._conn.commit()
+            tid = cur.lastrowid
+        return self.load_paper_trade(tid)
+
+    def close_paper_trade(self, trade_id: int, close_price: float, close_ts_ms: int, pnl: float, status: str):
+        with self._lock:
+            self._conn.execute(
+                """UPDATE paper_trades SET status=?, close_price=?, close_ts=?, pnl_usd=?
+                   WHERE id=?""",
+                (status, close_price, close_ts_ms, pnl, trade_id),
+            )
+            self._conn.commit()
+
+    def load_paper_trade(self, trade_id: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT id, user_id, side, entry_price, size_usd, leverage, margin, liq_price,
+                          status, entry_ts, close_price, close_ts, pnl_usd
+                   FROM paper_trades WHERE id=?""",
+                (trade_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0], "user_id": row[1], "side": row[2], "entry_price": row[3],
+            "size_usd": row[4], "leverage": row[5], "margin": row[6], "liq_price": row[7],
+            "status": row[8], "entry_ts": row[9], "close_price": row[10],
+            "close_ts": row[11], "pnl_usd": row[12],
+        }
+
+    def load_open_paper_trades(self, user_id: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT id, user_id, side, entry_price, size_usd, leverage, margin, liq_price,
+                          status, entry_ts, close_price, close_ts, pnl_usd
+                   FROM paper_trades WHERE user_id=? AND status='open'
+                   ORDER BY entry_ts DESC""",
+                (user_id,),
+            ).fetchall()
+        return [
+            {"id": r[0], "user_id": r[1], "side": r[2], "entry_price": r[3],
+             "size_usd": r[4], "leverage": r[5], "margin": r[6], "liq_price": r[7],
+             "status": r[8], "entry_ts": r[9], "close_price": r[10],
+             "close_ts": r[11], "pnl_usd": r[12]} for r in rows
+        ]
+
+    def load_paper_trades(self, user_id: str, limit: int = 100) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT id, user_id, side, entry_price, size_usd, leverage, margin, liq_price,
+                          status, entry_ts, close_price, close_ts, pnl_usd
+                   FROM paper_trades WHERE user_id=?
+                   ORDER BY entry_ts DESC LIMIT ?""",
+                (user_id, limit),
+            ).fetchall()
+        return [
+            {"id": r[0], "user_id": r[1], "side": r[2], "entry_price": r[3],
+             "size_usd": r[4], "leverage": r[5], "margin": r[6], "liq_price": r[7],
+             "status": r[8], "entry_ts": r[9], "close_price": r[10],
+             "close_ts": r[11], "pnl_usd": r[12]} for r in rows
+        ]
+
+    def users_with_open_paper_trades(self) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT user_id FROM paper_trades WHERE status='open'"
+            ).fetchall()
+        return [r[0] for r in rows]
 
     def upsert_gex(self, symbol: str, ts: int, spot: float, flip_zone: float,
                    total_call_gex: float, total_put_gex: float, net_gex: float, state: str):

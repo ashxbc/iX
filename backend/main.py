@@ -23,6 +23,7 @@ from funding_engine import FundingOIEngine
 from gex_engine import GexEngine
 from liquidation_engine import LiquidationEngine
 from live_liq_engine import LiveLiquidationEngine
+from paper_engine import PaperEngine, valid_uid
 from taker_engine import TakerEngine
 from storage import Store
 
@@ -108,6 +109,12 @@ async def lifespan(app: FastAPI):
     app.state.gex = gex_eng
     app.state.gex_task = asyncio.create_task(gex_eng.run())
 
+    # Paper trading engine (uses basis perp mid as the live mark)
+    print("[boot] starting paper trading engine")
+    paper_eng = PaperEngine(store, basis_eng)
+    app.state.paper = paper_eng
+    app.state.paper_task = asyncio.create_task(paper_eng.run())
+
     # Liquidation heatmap engine (BTC only)
     app.state.liquidation = None
     app.state.liquidation_task = None
@@ -126,7 +133,8 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         extra_tasks = []
-        for attr in ("funding_task", "basis_task", "liquidation_task", "live_liq_task", "taker_task", "gex_task"):
+        for attr in ("funding_task", "basis_task", "liquidation_task", "live_liq_task",
+                     "taker_task", "gex_task", "paper_task"):
             t = getattr(app.state, attr, None)
             if t is not None:
                 t.cancel()
@@ -219,6 +227,95 @@ async def basis_feed(ws: WebSocket, token: str | None = Query(default=None)):
         pass
     finally:
         eng.off_update(listener)
+
+
+def _paper_uid_or_400(uid: str | None) -> str:
+    if not valid_uid(uid):
+        raise HTTPException(status_code=400, detail="invalid uid")
+    return uid  # type: ignore[return-value]
+
+
+@app.get("/api/paper/account", dependencies=[Depends(require_auth)])
+async def paper_account(uid: str = Query(...)):
+    u = _paper_uid_or_400(uid)
+    eng: PaperEngine = app.state.paper
+    return eng.account_snapshot(u)
+
+
+@app.get("/api/paper/trades", dependencies=[Depends(require_auth)])
+async def paper_trades(uid: str = Query(...), limit: int = 100):
+    u = _paper_uid_or_400(uid)
+    eng: PaperEngine = app.state.paper
+    return {"trades": eng.history(u, limit)}
+
+
+@app.post("/api/paper/open", dependencies=[Depends(require_auth)])
+async def paper_open(payload: dict):
+    u = _paper_uid_or_400(payload.get("uid"))
+    eng: PaperEngine = app.state.paper
+    try:
+        trade = eng.open_trade(
+            u,
+            side=payload.get("side", ""),
+            size_usd=payload.get("size_usd", 0),
+            leverage=payload.get("leverage", 1),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"trade": trade, "account": eng.account_snapshot(u)}
+
+
+@app.post("/api/paper/close", dependencies=[Depends(require_auth)])
+async def paper_close(payload: dict):
+    u = _paper_uid_or_400(payload.get("uid"))
+    try:
+        tid = int(payload.get("trade_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invalid trade_id")
+    eng: PaperEngine = app.state.paper
+    try:
+        trade = eng.close_trade(u, tid)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"trade": trade, "account": eng.account_snapshot(u)}
+
+
+@app.post("/api/paper/reset", dependencies=[Depends(require_auth)])
+async def paper_reset(payload: dict):
+    u = _paper_uid_or_400(payload.get("uid"))
+    eng: PaperEngine = app.state.paper
+    eng.reset_account(u)
+    return {"account": eng.account_snapshot(u)}
+
+
+@app.websocket("/ws/paper")
+async def paper_feed(ws: WebSocket, token: str | None = Query(default=None), uid: str | None = Query(default=None)):
+    if not _check_token(token):
+        await ws.close(code=4401)
+        return
+    if not valid_uid(uid):
+        await ws.close(code=4400)
+        return
+    eng: PaperEngine = app.state.paper
+    await ws.accept()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+
+    async def listener(event: str, payload: dict):
+        try:
+            queue.put_nowait({"event": event, "data": payload})
+        except asyncio.QueueFull:
+            pass
+
+    eng.on_update(uid, listener)  # type: ignore[arg-type]
+    try:
+        await ws.send_text(json.dumps({"event": "snapshot", "data": eng.account_snapshot(uid)}))  # type: ignore[arg-type]
+        while True:
+            msg = await queue.get()
+            await ws.send_text(json.dumps(msg))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        eng.off_update(uid, listener)  # type: ignore[arg-type]
 
 
 @app.get("/api/gex", dependencies=[Depends(require_auth)])

@@ -37,10 +37,14 @@
         <div class="tfs" id="tfs"></div>
         <div class="status" id="status">disconnected</div>
       </div>
+      <div class="header-mid">
+        <button id="my-trades-btn" class="trades-btn">My Trades <span id="open-pos-count" class="pos-badge" hidden>0</span></button>
+      </div>
       <div class="readout">
         <span class="lbl">price</span><span id="px">—</span>
         <span class="lbl">cvd</span><span id="cvd">—</span>
         <span class="lbl">delta</span><span id="delta">—</span>
+        <span class="lbl">balance</span><span id="balance">—</span>
         <button id="liq-toggle" class="icon-btn" title="toggle liquidation heatmap" aria-pressed="false">
           <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
             <rect x="1"  y="9"  width="2" height="5" rx="0.5"/>
@@ -55,6 +59,59 @@
         </button>
       </div>
     </header>
+
+    <div id="trades-modal" class="modal" hidden>
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-content">
+        <div class="modal-header">
+          <span class="modal-title">paper trading</span>
+          <span class="modal-equity">
+            <span class="lbl">balance</span><span id="modal-balance">—</span>
+            <span class="lbl">equity</span><span id="modal-equity">—</span>
+            <span class="lbl">unrealized</span><span id="modal-unrealized">—</span>
+            <button id="reset-account" class="ghost-btn" title="reset account to $1000">reset</button>
+          </span>
+          <button class="modal-close" data-close="1" aria-label="close">×</button>
+        </div>
+
+        <div class="modal-section">
+          <div class="trade-form">
+            <div class="side-toggle">
+              <button class="side-btn active" data-side="long">LONG</button>
+              <button class="side-btn" data-side="short">SHORT</button>
+            </div>
+            <div class="form-row">
+              <label class="form-field">
+                <span>size (USD)</span>
+                <input type="number" id="trade-size" value="100" min="1" step="10" />
+              </label>
+              <label class="form-field">
+                <span>leverage <b id="lev-display">10x</b></span>
+                <input type="range" id="trade-leverage" min="1" max="100" value="10" />
+              </label>
+            </div>
+            <div class="trade-summary">
+              <div><span class="lbl">margin</span><b id="trade-margin">$10.00</b></div>
+              <div><span class="lbl">notional</span><b id="trade-notional">$100.00</b></div>
+              <div><span class="lbl">est. liq</span><b id="trade-liq">—</b></div>
+              <div><span class="lbl">mark</span><b id="trade-mark">—</b></div>
+            </div>
+            <button id="open-trade-btn" class="primary-btn long">OPEN LONG</button>
+            <div id="trade-error" class="form-error"></div>
+          </div>
+        </div>
+
+        <div class="modal-section">
+          <div class="section-head">active positions <span id="active-count" class="muted">(0)</span></div>
+          <div id="active-trades" class="trades-list"></div>
+        </div>
+
+        <div class="modal-section">
+          <div class="section-head">history</div>
+          <div id="trade-history" class="trades-list compact"></div>
+        </div>
+      </div>
+    </div>
     <main style="display: none">
       <div id="price" class="pane"></div>
       <div id="cvd-pane" class="pane"></div>
