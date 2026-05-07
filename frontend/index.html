@@ -98,8 +98,10 @@
               <li data-phase="synthesizing">Synthesizing verdict</li>
               <li data-phase="complete">Analysis complete</li>
             </ol>
-            <div class="ai-stream-head">live reasoning</div>
+            <div class="ai-stream-head" id="ai-stream-head">chain-of-thought</div>
             <pre class="ai-stream" id="ai-stream"></pre>
+            <div class="ai-stream-head ai-answer-head" id="ai-answer-head" hidden>analysis</div>
+            <pre class="ai-stream ai-answer" id="ai-answer"></pre>
           </div>
 
           <div class="ai-result" id="ai-result" hidden>

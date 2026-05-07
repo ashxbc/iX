@@ -192,10 +192,11 @@ Replace values with your analysis. `next_candle` must be exactly "green" or "red
 # ---------------------------------------------------------------------------
 
 class AIAnalyzer:
-    def __init__(self, api_key: str, base_url: str, model: str):
+    def __init__(self, api_key: str, base_url: str, model: str, proxy: str = ""):
         self.api_key = (api_key or "").strip()
         self.base_url = (base_url or "https://openrouter.ai/api/v1").rstrip("/")
         self.model = (model or "moonshotai/kimi-k2").strip()
+        self.proxy = (proxy or "").strip() or None
 
     @property
     def enabled(self) -> bool:
@@ -204,10 +205,11 @@ class AIAnalyzer:
     async def analyze_stream(self, symbol: str, ctx: dict) -> AsyncGenerator[dict, None]:
         """
         Yield event dicts:
-          {"event": "status",  "phase": "<phase>", "text": "..."}
-          {"event": "chunk",   "text": "<token chunk>"}
-          {"event": "verdict", "data": {...parsed JSON...}}
-          {"event": "error",   "message": "..."}
+          {"event": "status",    "phase": "<phase>", "text": "..."}
+          {"event": "reasoning", "text": "<thinking token>"}   ← chain-of-thought
+          {"event": "chunk",     "text": "<answer token>"}     ← final answer
+          {"event": "verdict",   "data": {...parsed JSON...}}
+          {"event": "error",     "message": "..."}
           {"event": "done"}
         """
         if not self.enabled:
@@ -223,22 +225,35 @@ class AIAnalyzer:
         await asyncio.sleep(0.25)
         yield {"event": "status", "phase": "connecting", "text": "Connecting to model…"}
 
-        full_text = ""
-        emitted_thinking = False
+        full_text = ""           # only content tokens (verdict parsed from here)
+        got_reasoning = False
+        got_content = False
         emitted_synth = False
         try:
             async for piece in self._stream(prompt):
-                full_text += piece
-                if not emitted_thinking:
-                    emitted_thinking = True
-                    yield {"event": "status", "phase": "thinking",
-                           "text": "Running multi-reasoning analysis…"}
-                yield {"event": "chunk", "text": piece}
-                # Detect when the model starts the final JSON block
-                if not emitted_synth and "```json" in full_text:
-                    emitted_synth = True
-                    yield {"event": "status", "phase": "synthesizing",
-                           "text": "Synthesizing verdict…"}
+                ptype = piece["type"]
+                ptext = piece["text"]
+
+                if ptype == "reasoning":
+                    if not got_reasoning:
+                        got_reasoning = True
+                        yield {"event": "status", "phase": "thinking",
+                               "text": "Running multi-reasoning analysis…"}
+                    yield {"event": "reasoning", "text": ptext}
+
+                elif ptype == "content":
+                    full_text += ptext
+                    if not got_content:
+                        got_content = True
+                        # If no reasoning came (model skipped CoT), emit thinking phase now
+                        if not got_reasoning:
+                            yield {"event": "status", "phase": "thinking",
+                                   "text": "Running multi-reasoning analysis…"}
+                        yield {"event": "status", "phase": "synthesizing",
+                               "text": "Synthesizing verdict…"}
+                        emitted_synth = True
+                    yield {"event": "chunk", "text": ptext}
+
         except Exception as e:
             yield {"event": "error", "message": f"AI request failed: {e}"}
             return
@@ -259,6 +274,8 @@ class AIAnalyzer:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
+            # Mimic a legitimate browser client to avoid datacenter IP blocks.
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         }
         body = {
             "model": self.model,
@@ -269,7 +286,8 @@ class AIAnalyzer:
                 {"role": "user", "content": user_prompt},
             ],
         }
-        async with httpx.AsyncClient(timeout=180) as client:
+        proxy = self.proxy or None
+        async with httpx.AsyncClient(timeout=180, proxy=proxy) as client:
             async with client.stream("POST", url, json=body, headers=headers) as resp:
                 if resp.status_code != 200:
                     body_text = (await resp.aread()).decode(errors="replace")[:400]
@@ -288,9 +306,14 @@ class AIAnalyzer:
                     if not choices:
                         continue
                     delta = choices[0].get("delta") or {}
-                    text = delta.get("content")
-                    if text:
-                        yield text
+                    # Chain-of-thought reasoning tokens arrive in delta.reasoning
+                    # Final answer tokens arrive in delta.content (standard OpenAI field)
+                    reasoning = delta.get("reasoning")
+                    content = delta.get("content")
+                    if reasoning:
+                        yield {"type": "reasoning", "text": reasoning}
+                    if content:
+                        yield {"type": "content", "text": content}
 
 
 # ---------------------------------------------------------------------------

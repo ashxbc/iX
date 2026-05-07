@@ -41,6 +41,7 @@ COINALYZE_API_KEY = os.environ.get("COINALYZE_API_KEY", "").strip()
 OPENCODE_API_KEY = os.environ.get("OPENCODE_API_KEY", "").strip()
 OPENCODE_BASE_URL = os.environ.get("OPENCODE_BASE_URL", "https://openrouter.ai/api/v1").strip()
 OPENCODE_MODEL = os.environ.get("OPENCODE_MODEL", "moonshotai/kimi-k2").strip()
+OPENCODE_PROXY = os.environ.get("OPENCODE_PROXY", "").strip()
 
 
 def _check_token(candidate: str | None) -> bool:
@@ -186,7 +187,7 @@ async def lifespan(app: FastAPI):
     app.state.tasks[("paper",)] = asyncio.create_task(paper_eng.run())
 
     # AI analyzer (manual on-demand, no background loop).
-    app.state.ai = AIAnalyzer(OPENCODE_API_KEY, OPENCODE_BASE_URL, OPENCODE_MODEL)
+    app.state.ai = AIAnalyzer(OPENCODE_API_KEY, OPENCODE_BASE_URL, OPENCODE_MODEL, OPENCODE_PROXY)
     if OPENCODE_API_KEY:
         print(f"[boot] AI analyzer enabled (model={OPENCODE_MODEL})")
     else:

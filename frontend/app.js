@@ -1467,11 +1467,14 @@ function aiResetUi() {
   $("ai-running").hidden = true;
   $("ai-result").hidden = true;
   $("ai-stream").textContent = "";
+  $("ai-answer").textContent = "";
+  $("ai-answer-head").hidden = true;
   $("ai-status").textContent = "initializing…";
   $("ai-error").hidden = true;
   $("ai-error").textContent = "";
   document.querySelectorAll("#ai-phases li").forEach((li) => li.classList.remove("active", "done"));
   ai.buffer = "";
+  ai.answerBuffer = "";
 }
 
 function aiShowRunning() {
@@ -1529,11 +1532,21 @@ function aiHandleEvent(msg) {
   if (msg.event === "status") {
     $("ai-status").textContent = msg.text || msg.phase || "…";
     if (msg.phase) aiSetPhase(msg.phase);
-  } else if (msg.event === "chunk") {
+  } else if (msg.event === "reasoning") {
+    // Chain-of-thought tokens — shown in the top "thinking" pane (muted)
     ai.buffer += msg.text || "";
     const stream = $("ai-stream");
     stream.textContent = ai.buffer;
     stream.scrollTop = stream.scrollHeight;
+  } else if (msg.event === "chunk") {
+    // Final answer tokens — shown in the bottom "analysis" pane (bright)
+    if (!ai.answerBuffer) {
+      $("ai-answer-head").hidden = false;
+    }
+    ai.answerBuffer = (ai.answerBuffer || "") + (msg.text || "");
+    const answer = $("ai-answer");
+    answer.textContent = ai.answerBuffer;
+    answer.scrollTop = answer.scrollHeight;
   } else if (msg.event === "verdict") {
     aiShowResult(msg.data || {});
   } else if (msg.event === "error") {

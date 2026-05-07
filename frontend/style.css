@@ -774,6 +774,21 @@ main {
   color: var(--mute);
   font-style: italic;
 }
+.ai-answer-head { margin-top: 10px; color: #c97cf4; }
+.ai-answer {
+  background: #0c0c0c;
+  border: 1px solid rgba(201,124,244,0.25);
+  padding: 10px 12px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: #e8e8e8;
+  max-height: 200px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+}
 
 /* ----- result view ----- */
 
