@@ -33,7 +33,18 @@
     <header style="display: none">
       <div class="brand">iX</div>
       <div class="controls">
-        <select id="symbol"></select>
+        <div class="symbol-search">
+          <input id="symbol-input" type="text" placeholder="search any token (BTC, ETH, ONDO…)"
+                 autocomplete="off" spellcheck="false" />
+          <div id="symbol-results" class="symbol-results" hidden></div>
+        </div>
+        <div class="token-meta" id="token-meta">
+          <img id="token-logo" class="token-logo" alt="" />
+          <div class="token-name" id="token-name">—</div>
+          <div class="token-price" id="token-price">—</div>
+          <div class="token-change" id="token-change">—</div>
+          <div class="token-volume"><span class="lbl">24h vol</span><span id="token-volume">—</span></div>
+        </div>
         <div class="tfs" id="tfs"></div>
         <div class="status" id="status">disconnected</div>
       </div>

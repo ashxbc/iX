@@ -45,10 +45,167 @@ function symParam() {
   return `&symbol=${encodeURIComponent(state.symbol)}`;
 }
 
+/* ============================================================
+   Symbol search + token meta
+   ============================================================ */
+
+const tokenMeta = {
+  current: null,        // last loaded meta object
+  refreshTimer: null,
+  searchAbort: null,
+  searchTimer: null,
+};
+
+function fmtTokenPrice(v) {
+  if (v == null || !isFinite(v) || v === 0) return "—";
+  if (v >= 1000)   return `$${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  if (v >= 1)      return `$${v.toFixed(3)}`;
+  if (v >= 0.01)   return `$${v.toFixed(4)}`;
+  if (v >= 0.0001) return `$${v.toFixed(6)}`;
+  return `$${v.toExponential(3)}`;
+}
+function fmtVol(v) {
+  if (v == null || !isFinite(v)) return "—";
+  const a = Math.abs(v);
+  if (a >= 1e9) return `$${(v/1e9).toFixed(2)}B`;
+  if (a >= 1e6) return `$${(v/1e6).toFixed(2)}M`;
+  if (a >= 1e3) return `$${(v/1e3).toFixed(1)}K`;
+  return `$${v.toFixed(0)}`;
+}
+
+async function loadTokenMeta(symbol) {
+  try {
+    const r = await fetch(
+      `${HTTP}://${BACKEND}/api/symbols/meta?symbol=${encodeURIComponent(symbol)}`,
+      { headers: { "X-Auth-Token": state.token }, cache: "no-store", credentials: "omit" }
+    );
+    if (!r.ok) throw new Error(`meta ${r.status}`);
+    const meta = await r.json();
+    if (state.symbol !== symbol) return;   // user switched away
+    tokenMeta.current = meta;
+    renderTokenMeta(meta);
+    // Capabilities can vary per coin; refresh the per-symbol caps.
+    if (meta.capabilities) {
+      state.capabilities[symbol] = meta.capabilities;
+      applyCapabilities();
+    }
+  } catch (e) {
+    // Soft-fail: meta isn't critical. Show base only.
+    console.warn("[meta]", e.message);
+  }
+}
+
+function renderTokenMeta(m) {
+  if (!m) return;
+  const logo = $("token-logo");
+  if (m.logo) { logo.src = m.logo; logo.style.display = ""; }
+  else { logo.removeAttribute("src"); logo.style.display = "none"; }
+  $("token-name").textContent = m.base || "—";
+  $("token-price").textContent = fmtTokenPrice(m.price);
+  const chg = Number(m.change_24h_pct || 0);
+  const chgEl = $("token-change");
+  chgEl.textContent = `${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%`;
+  chgEl.classList.toggle("up", chg > 0);
+  chgEl.classList.toggle("down", chg < 0);
+  $("token-volume").textContent = fmtVol(m.volume_24h_usd);
+}
+
+function startTokenMetaRefresh() {
+  if (tokenMeta.refreshTimer) clearInterval(tokenMeta.refreshTimer);
+  tokenMeta.refreshTimer = setInterval(() => {
+    if (state.symbol) loadTokenMeta(state.symbol);
+  }, 8_000);
+}
+
+/* ----- search dropdown ----- */
+
+function renderSearchResults(results, query) {
+  const wrap = $("symbol-results");
+  if (!results || results.length === 0) {
+    wrap.innerHTML = `<div class="empty">${query ? `no Binance perp for "${query}"` : "type to search"}</div>`;
+    wrap.hidden = false;
+    return;
+  }
+  wrap.innerHTML = "";
+  for (const r of results) {
+    const row = document.createElement("div");
+    row.className = "symbol-row";
+    row.dataset.symbol = r.symbol;
+    const logoUrl = r.logo || "";
+    row.innerHTML = `
+      <img class="sym-logo" src="${logoUrl}" alt="" onerror="this.style.visibility='hidden'" />
+      <div class="sym-name">
+        <span class="sym-base">${r.base}</span>
+        <span class="sym-full">${r.name || ""}</span>
+      </div>
+      <span class="sym-rank">${r.rank ? `#${r.rank}` : ""}</span>
+    `;
+    row.onclick = () => {
+      switchSymbol(r.symbol);
+      $("symbol-input").value = "";
+      wrap.hidden = true;
+    };
+    wrap.appendChild(row);
+  }
+  wrap.hidden = false;
+}
+
+async function runSymbolSearch(query) {
+  query = query.trim();
+  if (!query) {
+    $("symbol-results").hidden = true;
+    return;
+  }
+  // Abort any in-flight search
+  if (tokenMeta.searchAbort) tokenMeta.searchAbort.abort();
+  const ctl = new AbortController();
+  tokenMeta.searchAbort = ctl;
+  try {
+    const r = await fetch(
+      `${HTTP}://${BACKEND}/api/symbols/search?q=${encodeURIComponent(query)}`,
+      { headers: { "X-Auth-Token": state.token }, signal: ctl.signal, credentials: "omit" }
+    );
+    if (!r.ok) return;
+    const data = await r.json();
+    renderSearchResults(data.results || [], query);
+  } catch (e) {
+    if (e.name !== "AbortError") console.warn("[search]", e.message);
+  }
+}
+
+function initSymbolSearch() {
+  const input = $("symbol-input");
+  const wrap = $("symbol-results");
+  input.addEventListener("input", () => {
+    if (tokenMeta.searchTimer) clearTimeout(tokenMeta.searchTimer);
+    tokenMeta.searchTimer = setTimeout(() => runSymbolSearch(input.value), 180);
+  });
+  input.addEventListener("focus", () => {
+    if (input.value.trim()) runSymbolSearch(input.value);
+  });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      input.blur();
+      wrap.hidden = true;
+    } else if (e.key === "Enter") {
+      const first = wrap.querySelector(".symbol-row");
+      if (first) first.click();
+    }
+  });
+  document.addEventListener("click", (e) => {
+    if (!input.contains(e.target) && !wrap.contains(e.target)) {
+      wrap.hidden = true;
+    }
+  });
+}
+
 /* ---------- symbol switching ---------- */
 
 function caps() {
-  return state.capabilities[state.symbol] || { spot: true, gex: true, heatmap: true };
+  // Conservative defaults: assume only perp + spot are likely; GEX is BTC/ETH
+  // only and heatmap depends on Coinalyze coverage. Once /api/symbols/meta
+  // returns we replace this with the real caps for the symbol.
+  return state.capabilities[state.symbol] || { spot: true, gex: false, heatmap: false };
 }
 
 function applyCapabilities() {
@@ -154,6 +311,8 @@ function switchSymbol(newSym) {
   // Refresh the paper-trade form preview (button label, liq estimate) since
   // they depend on the current symbol's mark price.
   if (typeof updateTradePreview === "function") updateTradePreview();
+  // Pull token metadata for the new coin (logo, price, 24h vol, capabilities).
+  loadTokenMeta(newSym);
 }
 
 async function verifyToken(token) {
@@ -1830,23 +1989,15 @@ async function init() {
 
   state.capabilities = r.capabilities || {};
 
-  // Validate the persisted symbol; fall back to server default if it was
-  // removed since last visit.
-  if (!r.symbols.includes(state.symbol)) {
-    state.symbol = r.default || r.symbols[0];
+  // The dropdown is gone — search bar handles arbitrary tokens. The persisted
+  // symbol just needs to be SOMETHING (no validation against the warm list,
+  // since search supports any Binance perp). If nothing stored, use default.
+  if (!state.symbol) {
+    state.symbol = r.default || "BTCUSDT";
     localStorage.setItem("ix_symbol", state.symbol);
   }
 
-  const sel = $("symbol");
-  sel.innerHTML = "";
-  r.symbols.forEach((s) => {
-    const o = document.createElement("option");
-    o.value = s;
-    o.textContent = SYMBOL_LABEL[s] || s.replace(/USDT$/, "");
-    sel.appendChild(o);
-  });
-  sel.value = state.symbol;
-  sel.onchange = () => switchSymbol(sel.value);
+  initSymbolSearch();
 
   const tfs = $("tfs");
   tfs.innerHTML = "";
@@ -1870,6 +2021,10 @@ async function init() {
   connectPaperWs();
   initAiUi();
   attachAnchorHandler();
+
+  // Token meta strip — load now and refresh every 8s.
+  loadTokenMeta(state.symbol);
+  startTokenMetaRefresh();
 }
 
 init();

@@ -26,6 +26,7 @@ from iceberg_engine import IcebergEngine
 from liquidation_engine import LiquidationEngine
 from live_liq_engine import LiveLiquidationEngine
 from paper_engine import PaperEngine, valid_uid
+from symbol_registry import SymbolRegistry
 from taker_engine import TakerEngine
 from storage import Store
 
@@ -61,27 +62,140 @@ async def require_auth(
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
-SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "HYPEUSDT", "ZECUSDT", "TONUSDT",
-    "NEARUSDT", "ONDOUSDT", "ENAUSDT", "MONUSDT", "MEGAUSDT", "OPUSDT",
-    "BNBUSDT", "XMRUSDT",
-]
-# Per-coin spot source. Coins missing from this map use Binance spot. Coins
-# without a Binance Spot pair fall back to the next-biggest exchange listing
-# the asset, so basis (spot vs perp) still works for them.
+# Warm symbols: spawned at boot, kept running 24/7. Used to keep BTC/ETH
+# always-instant for default loads + paper trading mark + GEX (Deribit
+# only lists BTC/ETH options anyway, so GEX must live here).
+WARM_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+# Override spot source for coins with no Binance USDT spot pair. Lazy-spawned
+# coins not in this map use Binance spot if available, else basis is skipped.
 ALT_SPOT_SOURCES: dict[str, dict] = {
     "HYPEUSDT": {"exchange": "bybit",  "spot_symbol": "HYPEUSDT"},
     "XMRUSDT":  {"exchange": "kucoin", "spot_symbol": "XMR-USDT"},
-    # MON: Monad mainnet listings are pre-market only on every major venue;
-    #      no reliable spot mid yet. Skip basis for it.
 }
-SYMBOLS_NO_SPOT = {"MONUSDT"}
-# GEX is only meaningful where a deep options market exists. Deribit lists
-# BTC and ETH (SOL exists but OI is too thin to be reliable). Map perp symbol
-# to Deribit currency code.
+# GEX is only meaningful where a deep options market exists.
 GEX_CURRENCIES = {"BTCUSDT": "BTC", "ETHUSDT": "ETH"}
 DEFAULT_SYMBOL = "BTCUSDT"
 TIMEFRAMES = list(TIMEFRAME_MS.keys())
+
+
+async def _spawn_engines_for(app: FastAPI, sym: str, store: Store, with_gex: bool = False):
+    """
+    Construct + seed + start every engine relevant for `sym`. Idempotent: if
+    a given engine already exists for the symbol, skip it. Caller must ensure
+    the symbol is a valid Binance USDT-M perp (use the registry).
+    """
+    sym = sym.upper()
+    registry: SymbolRegistry = app.state.registry
+
+    seed_coros = []
+
+    # CVD per timeframe
+    for tf in TIMEFRAMES:
+        key = (sym.lower(), tf)
+        if key not in app.state.engines:
+            eng = CVDEngine(sym, tf, store)
+            app.state.engines[key] = eng
+            seed_coros.append(eng.seed_history())
+
+    # Funding/OI
+    if sym not in app.state.funding:
+        fund_eng = FundingOIEngine(sym, store)
+        app.state.funding[sym] = fund_eng
+        seed_coros.append(fund_eng.seed_history())
+
+    # Basis — only if a spot pair exists (Binance, Bybit alt, or KuCoin alt)
+    if sym not in app.state.basis:
+        alt = ALT_SPOT_SOURCES.get(sym)
+        if alt:
+            basis_eng = BasisEngine(
+                sym, store,
+                spot_exchange=alt["exchange"],
+                spot_symbol=alt["spot_symbol"],
+            )
+            app.state.basis[sym] = basis_eng
+            seed_coros.append(basis_eng.seed_history())
+        elif registry.has_spot(sym):
+            basis_eng = BasisEngine(sym, store)
+            app.state.basis[sym] = basis_eng
+            seed_coros.append(basis_eng.seed_history())
+        # else: no spot anywhere — basis pane will show "no spot pair"
+
+    # Live liquidation feed
+    if sym not in app.state.live_liq:
+        app.state.live_liq[sym] = LiveLiquidationEngine(sym)
+
+    # Iceberg / whale absorption
+    if sym not in app.state.iceberg:
+        app.state.iceberg[sym] = IcebergEngine(sym)
+
+    # Taker ratio
+    if sym not in app.state.taker:
+        taker_eng = TakerEngine(sym, store)
+        app.state.taker[sym] = taker_eng
+        seed_coros.append(taker_eng.seed_history())
+
+    # GEX — only when explicitly requested AND Deribit lists this asset
+    if with_gex and sym in GEX_CURRENCIES and sym not in app.state.gex:
+        gex_eng = GexEngine(sym, store, currency=GEX_CURRENCIES[sym])
+        app.state.gex[sym] = gex_eng
+        seed_coros.append(gex_eng.seed_history())
+
+    # Coinalyze liquidation heatmap
+    if COINALYZE_API_KEY and sym not in app.state.liquidation:
+        liq_eng = LiquidationEngine(sym, f"{sym}_PERP.A", COINALYZE_API_KEY, store)
+        app.state.liquidation[sym] = liq_eng
+        seed_coros.append(liq_eng.seed_history())
+
+    if seed_coros:
+        await asyncio.gather(*seed_coros, return_exceptions=True)
+
+    # Start any tasks that aren't running yet
+    tasks = app.state.tasks
+    for tf in TIMEFRAMES:
+        k = ("cvd", sym, tf)
+        if k not in tasks:
+            tasks[k] = asyncio.create_task(app.state.engines[(sym.lower(), tf)].run())
+    if ("funding", sym) not in tasks:
+        tasks[("funding", sym)] = asyncio.create_task(app.state.funding[sym].run())
+    if sym in app.state.basis and ("basis", sym) not in tasks:
+        tasks[("basis", sym)] = asyncio.create_task(app.state.basis[sym].run())
+    if ("live_liq", sym) not in tasks:
+        tasks[("live_liq", sym)] = asyncio.create_task(app.state.live_liq[sym].run())
+    if ("iceberg", sym) not in tasks:
+        tasks[("iceberg", sym)] = asyncio.create_task(app.state.iceberg[sym].run())
+    if ("taker", sym) not in tasks:
+        tasks[("taker", sym)] = asyncio.create_task(app.state.taker[sym].run())
+    if sym in app.state.gex and ("gex", sym) not in tasks:
+        tasks[("gex", sym)] = asyncio.create_task(app.state.gex[sym].run())
+    if sym in app.state.liquidation and ("liq", sym) not in tasks:
+        tasks[("liq", sym)] = asyncio.create_task(app.state.liquidation[sym].run())
+
+
+async def ensure_engines(sym: str) -> bool:
+    """
+    Spawn engines for `sym` on first request. Returns True if the symbol is
+    a tradeable Binance perp (or already spawned), False otherwise.
+    Concurrency-safe via a per-symbol lock so duplicate WS connects don't
+    spawn duplicate engines.
+    """
+    sym = sym.upper()
+    registry: SymbolRegistry = app.state.registry
+    if not registry.has_perp(sym):
+        return False
+    if sym in app.state.taker:
+        return True   # fast-path: already spawned
+
+    locks = app.state.spawn_locks
+    lock = locks.get(sym)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[sym] = lock
+    async with lock:
+        if sym in app.state.taker:
+            return True
+        print(f"[lazy] spawning engines for {sym}")
+        await _spawn_engines_for(app, sym, app.state.store, with_gex=False)
+    return True
 
 
 @asynccontextmanager
@@ -99,82 +213,18 @@ async def lifespan(app: FastAPI):
     app.state.iceberg: dict[str, IcebergEngine] = {}
     app.state.liquidation: dict[str, LiquidationEngine] = {}
     app.state.tasks: dict = {}
+    app.state.spawn_locks: dict[str, asyncio.Lock] = {}
 
-    # Construct everything first so we can seed in parallel (14 coins serially
-    # would take 30+ seconds on cold start).
-    seed_coros = []
-    for sym in SYMBOLS:
-        # CVD per (symbol, timeframe)
-        for tf in TIMEFRAMES:
-            eng = CVDEngine(sym, tf, store)
-            app.state.engines[(sym.lower(), tf)] = eng
-            seed_coros.append(eng.seed_history())
+    # Boot the symbol registry first — drives validation + search + meta.
+    registry = SymbolRegistry()
+    await registry.init()
+    app.state.registry = registry
 
-        # Funding/OI — every USDT-M perp has funding
-        fund_eng = FundingOIEngine(sym, store)
-        app.state.funding[sym] = fund_eng
-        seed_coros.append(fund_eng.seed_history())
-
-        # Basis — Binance spot by default, Bybit/KuCoin fallback for the
-        # coins Binance doesn't list spot. Only MON has no working spot.
-        if sym not in SYMBOLS_NO_SPOT:
-            alt = ALT_SPOT_SOURCES.get(sym)
-            if alt:
-                basis_eng = BasisEngine(
-                    sym, store,
-                    spot_exchange=alt["exchange"],
-                    spot_symbol=alt["spot_symbol"],
-                )
-            else:
-                basis_eng = BasisEngine(sym, store)
-            app.state.basis[sym] = basis_eng
-            seed_coros.append(basis_eng.seed_history())
-
-        # Live liquidation WS (forceOrder) — exists on every USDT-M perp
-        app.state.live_liq[sym] = LiveLiquidationEngine(sym)
-
-        # Iceberg / whale-absorption detection — every USDT-M perp has trade
-        # tape + partial book streams.
-        app.state.iceberg[sym] = IcebergEngine(sym)
-
-        # Taker ratio (kline_5m/15m/1h) — every perp
-        taker_eng = TakerEngine(sym, store)
-        app.state.taker[sym] = taker_eng
-        seed_coros.append(taker_eng.seed_history())
-
-        # GEX — only if Deribit lists this currency's options
-        if sym in GEX_CURRENCIES:
-            gex_eng = GexEngine(sym, store, currency=GEX_CURRENCIES[sym])
-            app.state.gex[sym] = gex_eng
-            seed_coros.append(gex_eng.seed_history())
-
-        # Coinalyze liquidation heatmap — same ticker pattern across coins;
-        # if Coinalyze doesn't list it, the engine logs and returns empty.
-        if COINALYZE_API_KEY:
-            liq_eng = LiquidationEngine(sym, f"{sym}_PERP.A", COINALYZE_API_KEY, store)
-            app.state.liquidation[sym] = liq_eng
-            seed_coros.append(liq_eng.seed_history())
-
-    print(f"[boot] seeding {len(seed_coros)} engines for {len(SYMBOLS)} symbols (parallel)")
-    await asyncio.gather(*seed_coros, return_exceptions=True)
-
-    # Now spin up the run loops.
-    for (sym, tf), eng in app.state.engines.items():
-        app.state.tasks[("cvd", sym, tf)] = asyncio.create_task(eng.run())
-    for sym, e in app.state.funding.items():
-        app.state.tasks[("funding", sym)] = asyncio.create_task(e.run())
-    for sym, e in app.state.basis.items():
-        app.state.tasks[("basis", sym)] = asyncio.create_task(e.run())
-    for sym, e in app.state.live_liq.items():
-        app.state.tasks[("live_liq", sym)] = asyncio.create_task(e.run())
-    for sym, e in app.state.iceberg.items():
-        app.state.tasks[("iceberg", sym)] = asyncio.create_task(e.run())
-    for sym, e in app.state.taker.items():
-        app.state.tasks[("taker", sym)] = asyncio.create_task(e.run())
-    for sym, e in app.state.gex.items():
-        app.state.tasks[("gex", sym)] = asyncio.create_task(e.run())
-    for sym, e in app.state.liquidation.items():
-        app.state.tasks[("liq", sym)] = asyncio.create_task(e.run())
+    # Spawn engines for the warm set (BTC + ETH) so they're instant on first
+    # load and so GEX can run (Deribit only lists those two anyway).
+    print(f"[boot] spawning warm engines for {WARM_SYMBOLS}")
+    for sym in WARM_SYMBOLS:
+        await _spawn_engines_for(app, sym, store, with_gex=(sym in GEX_CURRENCIES))
 
     # Paper trading mark provider: any of the 14 coins. Basis engine has the
     # most accurate live mid (2s polling); CVD candles are the fallback when
@@ -260,22 +310,52 @@ async def auth_check(_: None = Depends(require_auth)):
     return {"ok": True}
 
 
+def _caps_for(sym: str) -> dict:
+    """Compute per-symbol capability flags. Used both by /api/symbols (for
+    warm) and per-symbol meta endpoints. The frontend uses this to show or
+    grey-out panels (basis, GEX, heatmap)."""
+    sym = sym.upper()
+    registry: SymbolRegistry = app.state.registry
+    has_spot_anywhere = registry.has_spot(sym) or sym in ALT_SPOT_SOURCES
+    return {
+        "spot": has_spot_anywhere,
+        "gex": sym in GEX_CURRENCIES,
+        "heatmap": bool(COINALYZE_API_KEY),
+        "perp": registry.has_perp(sym),
+    }
+
+
 @app.get("/api/symbols", dependencies=[Depends(require_auth)])
 async def symbols():
-    # Per-symbol capability map so the frontend knows which panels to show.
-    caps = {
-        sym: {
-            "spot": sym not in SYMBOLS_NO_SPOT,
-            "gex": sym in GEX_CURRENCIES,
-            "heatmap": bool(COINALYZE_API_KEY) and sym in app.state.liquidation,
-        } for sym in SYMBOLS
-    }
+    # Just enough for the frontend to bootstrap. Search + per-symbol meta
+    # supersede the old hardcoded dropdown, so we only ship the warm set.
+    caps = {sym: _caps_for(sym) for sym in WARM_SYMBOLS}
     return {
-        "symbols": SYMBOLS,
+        "symbols": WARM_SYMBOLS,
         "default": DEFAULT_SYMBOL,
         "timeframes": TIMEFRAMES,
         "capabilities": caps,
     }
+
+
+@app.get("/api/symbols/search", dependencies=[Depends(require_auth)])
+async def symbols_search(q: str = "", limit: int = 12):
+    if not q.strip():
+        return {"results": []}
+    registry: SymbolRegistry = app.state.registry
+    results = await registry.search(q, limit=limit)
+    return {"results": results}
+
+
+@app.get("/api/symbols/meta", dependencies=[Depends(require_auth)])
+async def symbols_meta(symbol: str):
+    sym = symbol.upper()
+    registry: SymbolRegistry = app.state.registry
+    if not registry.has_perp(sym):
+        raise HTTPException(status_code=404, detail=f"{sym} not on Binance USDT-M perps")
+    meta = await registry.get_meta(sym)
+    meta["capabilities"] = _caps_for(sym)
+    return meta
 
 
 @app.get("/api/status", dependencies=[Depends(require_auth)])
@@ -320,6 +400,8 @@ async def basis_feed(
         await ws.close(code=4401)
         return
     sym = (symbol or DEFAULT_SYMBOL).upper()
+    if not await ensure_engines(sym):
+        await ws.close(code=4404); return
     eng = app.state.basis.get(sym)
     if eng is None:
         await ws.close(code=4404)
@@ -549,6 +631,8 @@ async def taker_feed(
         await ws.close(code=4401)
         return
     sym = (symbol or DEFAULT_SYMBOL).upper()
+    if not await ensure_engines(sym):
+        await ws.close(code=4404); return
     eng = app.state.taker.get(sym)
     if eng is None:
         await ws.close(code=4404)
@@ -591,6 +675,8 @@ async def iceberg_feed(
         await ws.close(code=4401)
         return
     sym = (symbol or DEFAULT_SYMBOL).upper()
+    if not await ensure_engines(sym):
+        await ws.close(code=4404); return
     eng = app.state.iceberg.get(sym)
     if eng is None:
         await ws.close(code=4404)
@@ -626,6 +712,8 @@ async def live_liq_feed(
         await ws.close(code=4401)
         return
     sym = (symbol or DEFAULT_SYMBOL).upper()
+    if not await ensure_engines(sym):
+        await ws.close(code=4404); return
     eng = app.state.live_liq.get(sym)
     if eng is None:
         await ws.close(code=4404)
@@ -667,6 +755,8 @@ async def liquidations_feed(
         await ws.close(code=4401)
         return
     sym = (symbol or DEFAULT_SYMBOL).upper()
+    if not await ensure_engines(sym):
+        await ws.close(code=4404); return
     eng = app.state.liquidation.get(sym)
     if eng is None:
         await ws.close(code=4404)
@@ -700,6 +790,8 @@ async def funding_feed(
         await ws.close(code=4401)
         return
     sym = (symbol or DEFAULT_SYMBOL).upper()
+    if not await ensure_engines(sym):
+        await ws.close(code=4404); return
     eng = app.state.funding.get(sym)
     if eng is None:
         await ws.close(code=4404)
@@ -730,6 +822,9 @@ async def feed(ws: WebSocket, symbol: str, timeframe: str, token: str | None = Q
         return
     if timeframe not in TIMEFRAME_MS:
         await ws.close(code=4400)
+        return
+    if not await ensure_engines(symbol):
+        await ws.close(code=4404)
         return
     key = (symbol.lower(), timeframe)
     engine: CVDEngine | None = app.state.engines.get(key)
