@@ -454,8 +454,12 @@ async def paper_open(payload: dict):
     u = _paper_uid_or_400(payload.get("uid"))
     eng: PaperEngine = app.state.paper
     sym = (payload.get("symbol") or DEFAULT_SYMBOL).upper()
-    if sym not in SYMBOLS:
+    registry: SymbolRegistry = app.state.registry
+    if not registry.has_perp(sym):
         raise HTTPException(status_code=400, detail=f"unsupported symbol {sym}")
+    # Make sure mark price is available — spawn engines for the symbol if
+    # this is the first trade on it.
+    await ensure_engines(sym)
     try:
         trade = eng.open_trade(
             u,
@@ -530,11 +534,14 @@ async def ai_analysis_feed(
         await ws.close(code=4401)
         return
     sym = (symbol or DEFAULT_SYMBOL).upper()
-    if sym not in SYMBOLS:
+    registry: SymbolRegistry = app.state.registry
+    if not registry.has_perp(sym):
         await ws.close(code=4400)
         return
     ai: AIAnalyzer = app.state.ai
     await ws.accept()
+    # Make sure engines are running so gather_context has live data.
+    await ensure_engines(sym)
 
     try:
         # Wait for the client's "start" command before doing any work.
