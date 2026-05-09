@@ -21,8 +21,8 @@ import websockets
 
 from storage import Store
 
-BINANCE_WS = "wss://stream.binance.com:9443/ws"
-BINANCE_REST = "https://api.binance.com"
+BINANCE_WS = "wss://fstream.binance.com/ws"
+BINANCE_REST = "https://fapi.binance.com"
 
 TIMEFRAME_MS = {
     "1m": 60_000,
@@ -114,7 +114,7 @@ class CVDEngine:
 
     async def _fetch_klines(self, start_time: int | None = None,
                             end_time: int | None = None, limit: int = 1000) -> list:
-        url = f"{BINANCE_REST}/api/v3/klines"
+        url = f"{BINANCE_REST}/fapi/v1/klines"
         params = {"symbol": self.symbol.upper(), "interval": self.timeframe,
                   "limit": min(max(limit, 1), 1000)}
         if start_time is not None:
