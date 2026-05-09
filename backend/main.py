@@ -400,13 +400,17 @@ async def basis_feed(
         await ws.close(code=4401)
         return
     sym = (symbol or DEFAULT_SYMBOL).upper()
+    # Accept FIRST so the WS handshake completes immediately and the browser
+    # holds the connection. Spawning engines for a fresh coin can take 5-15s
+    # during seed (REST calls to Binance for klines/funding/etc.) — without an
+    # early accept the handshake stalls and the browser drops it.
+    await ws.accept()
     if not await ensure_engines(sym):
         await ws.close(code=4404); return
     eng = app.state.basis.get(sym)
     if eng is None:
         await ws.close(code=4404)
         return
-    await ws.accept()
     queue: asyncio.Queue = asyncio.Queue(maxsize=400)
 
     async def listener(event: str, payload: dict):
@@ -631,13 +635,13 @@ async def taker_feed(
         await ws.close(code=4401)
         return
     sym = (symbol or DEFAULT_SYMBOL).upper()
+    await ws.accept()
     if not await ensure_engines(sym):
         await ws.close(code=4404); return
     eng = app.state.taker.get(sym)
     if eng is None:
         await ws.close(code=4404)
         return
-    await ws.accept()
     queue: asyncio.Queue = asyncio.Queue(maxsize=400)
 
     async def listener(event: str, payload: dict):
@@ -675,13 +679,13 @@ async def iceberg_feed(
         await ws.close(code=4401)
         return
     sym = (symbol or DEFAULT_SYMBOL).upper()
+    await ws.accept()
     if not await ensure_engines(sym):
         await ws.close(code=4404); return
     eng = app.state.iceberg.get(sym)
     if eng is None:
         await ws.close(code=4404)
         return
-    await ws.accept()
     queue: asyncio.Queue = asyncio.Queue(maxsize=50)
 
     async def listener(event: str, payload: dict):
@@ -712,13 +716,13 @@ async def live_liq_feed(
         await ws.close(code=4401)
         return
     sym = (symbol or DEFAULT_SYMBOL).upper()
+    await ws.accept()
     if not await ensure_engines(sym):
         await ws.close(code=4404); return
     eng = app.state.live_liq.get(sym)
     if eng is None:
         await ws.close(code=4404)
         return
-    await ws.accept()
     queue: asyncio.Queue = asyncio.Queue(maxsize=200)
 
     async def listener(event: str, payload: dict):
@@ -755,13 +759,13 @@ async def liquidations_feed(
         await ws.close(code=4401)
         return
     sym = (symbol or DEFAULT_SYMBOL).upper()
+    await ws.accept()
     if not await ensure_engines(sym):
         await ws.close(code=4404); return
     eng = app.state.liquidation.get(sym)
     if eng is None:
         await ws.close(code=4404)
         return
-    await ws.accept()
     queue: asyncio.Queue = asyncio.Queue(maxsize=50)
 
     async def listener(event: str, payload: dict):
@@ -790,13 +794,13 @@ async def funding_feed(
         await ws.close(code=4401)
         return
     sym = (symbol or DEFAULT_SYMBOL).upper()
+    await ws.accept()
     if not await ensure_engines(sym):
         await ws.close(code=4404); return
     eng = app.state.funding.get(sym)
     if eng is None:
         await ws.close(code=4404)
         return
-    await ws.accept()
     queue: asyncio.Queue = asyncio.Queue(maxsize=200)
 
     async def listener(event: str, payload: dict):
@@ -823,6 +827,10 @@ async def feed(ws: WebSocket, symbol: str, timeframe: str, token: str | None = Q
     if timeframe not in TIMEFRAME_MS:
         await ws.close(code=4400)
         return
+    # Accept FIRST — engine spawn for a fresh coin can take 5-15s for the
+    # historical klines seed, and the browser will timeout the handshake if
+    # we wait. Listener is attached after seed completes.
+    await ws.accept()
     if not await ensure_engines(symbol):
         await ws.close(code=4404)
         return
@@ -831,8 +839,6 @@ async def feed(ws: WebSocket, symbol: str, timeframe: str, token: str | None = Q
     if engine is None:
         await ws.close(code=4404)
         return
-
-    await ws.accept()
     queue: asyncio.Queue = asyncio.Queue(maxsize=200)
 
     async def listener(event: str, payload: dict):
