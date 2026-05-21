@@ -5,16 +5,16 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>iX</title>
     <!--
-    When deploying the frontend separately (e.g. on Vercel), set this meta tag
-    to the public host of your backend, without protocol:
-        <meta name="ix-backend" content="ix.yourdomain.com" />
-    When the frontend is served by FastAPI itself, leave it empty/omitted.
-  -->
+      Set this meta tag to the public host of your backend when deploying
+      the frontend separately (e.g. Vercel). Leave omitted when served by FastAPI.
+    -->
     <meta name="ix-backend" content="159-65-13-68.sslip.io" />
     <link rel="stylesheet" href="/static/style.css" />
     <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
   </head>
   <body>
+
+    <!-- AUTH OVERLAY -->
     <div id="auth-overlay" class="auth-overlay">
       <form id="auth-form" class="auth-form" autocomplete="off">
         <div class="auth-brand">iX</div>
@@ -30,67 +30,64 @@
       </form>
     </div>
 
-    <header style="display: none">
+    <!-- HEADER -->
+    <header style="display:none">
       <div class="brand">iX</div>
       <div class="controls">
         <div class="symbol-search">
-          <input id="symbol-input" type="text" placeholder="search any token (BTC, ETH, ONDO…)"
+          <input id="symbol-input" type="text"
+                 placeholder="search symbol (BTC, ETH, SOL…)"
                  autocomplete="off" spellcheck="false" />
           <div id="symbol-results" class="symbol-results" hidden></div>
         </div>
         <div class="token-meta" id="token-meta">
           <img id="token-logo" class="token-logo" alt="" />
-          <div class="token-name" id="token-name">—</div>
+          <div class="token-name"  id="token-name">—</div>
           <div class="token-price" id="token-price">—</div>
           <div class="token-change" id="token-change">—</div>
-          <div class="token-volume"><span class="lbl">24h vol</span><span id="token-volume">—</span></div>
+          <div class="token-volume">
+            <span class="lbl">24h vol</span>
+            <span id="token-volume">—</span>
+          </div>
         </div>
         <div class="tfs" id="tfs"></div>
         <div class="status" id="status">disconnected</div>
       </div>
       <div class="header-mid">
-        <button id="my-trades-btn" class="trades-btn">My Trades <span id="open-pos-count" class="pos-badge" hidden>0</span></button>
+        <button id="my-trades-btn" class="trades-btn">
+          My Trades
+          <span id="open-pos-count" class="pos-badge" hidden>0</span>
+        </button>
       </div>
       <div class="readout">
         <span class="lbl">price</span><span id="px">—</span>
-        <span class="lbl">cvd</span><span id="cvd">—</span>
-        <span class="lbl">delta</span><span id="delta">—</span>
+        <span class="lbl">mark</span><span id="mark-px">—</span>
         <span class="lbl">balance</span><span id="balance">—</span>
-        <button id="ai-btn" class="icon-btn" title="run AI analysis on current chart" aria-label="AI analysis">
+        <button id="ai-btn" class="icon-btn" title="ICT AI analysis" aria-label="AI analysis">
           <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
             <path d="M8 1.2 L9.4 5.2 L13.5 6.8 L9.6 8.7 L8.1 12.8 L6.5 8.8 L2.5 7.0 L6.5 5.2 Z" fill="currentColor"/>
             <circle cx="13" cy="2.8" r="1" fill="currentColor"/>
             <circle cx="2.5" cy="13" r="0.8" fill="currentColor"/>
           </svg>
         </button>
-        <button id="liq-toggle" class="icon-btn" title="toggle liquidation heatmap" aria-pressed="false">
-          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
-            <rect x="1"  y="9"  width="2" height="5" rx="0.5"/>
-            <rect x="4"  y="6"  width="2" height="8" rx="0.5"/>
-            <rect x="7"  y="3"  width="2" height="11" rx="0.5"/>
-            <rect x="10" y="7"  width="2" height="7" rx="0.5"/>
-            <rect x="13" y="10" width="2" height="4" rx="0.5"/>
-          </svg>
-        </button>
-        <button id="logout" class="logout" title="clear access token">
-          logout
-        </button>
+        <button id="logout" class="logout" title="clear access token">logout</button>
       </div>
     </header>
 
+    <!-- AI MODAL -->
     <div id="ai-modal" class="modal" hidden>
       <div class="modal-backdrop" data-close="1"></div>
       <div class="modal-content ai-content">
         <div class="modal-header">
-          <span class="modal-title">ai analysis · <span id="ai-symbol-display">BTC</span></span>
+          <span class="modal-title">ict analysis · <span id="ai-symbol-display">BTC</span></span>
           <button class="modal-close" data-close="1" aria-label="close">×</button>
         </div>
         <div class="ai-body">
           <div class="ai-intro" id="ai-intro">
             <p class="ai-blurb">
-              Run an institutional-grade analysis on the current chart. The model reads
-              live candles, CVD &amp; divergences, funding/OI, basis, taker flow, GEX,
-              and liquidation context — then commits to a verdict for the next candle.
+              Run an institutional-grade ICT analysis on the current chart. The model reads
+              live candles, order blocks, FVGs, liquidity sweeps, funding rate, and
+              premium/discount positioning — then produces a confluence verdict.
             </p>
             <button id="ai-run-btn" class="primary-btn">RUN ANALYSIS</button>
           </div>
@@ -101,11 +98,11 @@
               <div class="ai-status-text" id="ai-status">initializing…</div>
             </div>
             <ol class="ai-phases" id="ai-phases">
-              <li data-phase="reading">Reading market data</li>
-              <li data-phase="context">Analyzing historical behavior</li>
-              <li data-phase="metrics">Processing live metrics</li>
+              <li data-phase="reading">Reading ICT structure</li>
+              <li data-phase="context">Analyzing order blocks &amp; FVGs</li>
+              <li data-phase="metrics">Processing liquidity &amp; sweeps</li>
               <li data-phase="connecting">Connecting to model</li>
-              <li data-phase="thinking">Running multi-reasoning analysis</li>
+              <li data-phase="thinking">Running confluence analysis</li>
               <li data-phase="synthesizing">Synthesizing verdict</li>
               <li data-phase="complete">Analysis complete</li>
             </ol>
@@ -122,7 +119,7 @@
                 <div class="ai-val" id="ai-candle">—</div>
               </div>
               <div class="ai-card" id="ai-card-direction">
-                <div class="ai-lbl">direction</div>
+                <div class="ai-lbl">bias</div>
                 <div class="ai-val" id="ai-direction">—</div>
               </div>
               <div class="ai-card">
@@ -145,6 +142,7 @@
       </div>
     </div>
 
+    <!-- TRADES MODAL -->
     <div id="trades-modal" class="modal" hidden>
       <div class="modal-backdrop" data-close="1"></div>
       <div class="modal-content">
@@ -187,7 +185,9 @@
         </div>
 
         <div class="modal-section">
-          <div class="section-head">active positions <span id="active-count" class="muted">(0)</span></div>
+          <div class="section-head">
+            active positions <span id="active-count" class="muted">(0)</span>
+          </div>
           <div id="active-trades" class="trades-list"></div>
         </div>
 
@@ -197,50 +197,39 @@
         </div>
       </div>
     </div>
-    <main style="display: none">
+
+    <!-- MAIN CONTENT -->
+    <main style="display:none">
+
+      <!-- Price chart with ICT canvas overlay -->
       <div id="price" class="pane"></div>
-      <div id="cvd-pane" class="pane"></div>
-      <div id="taker-pane" class="pane">
-        <div class="taker-overlay">
-          <div class="taker-legend">
-            <span class="lg lg-5m">5m <b id="taker-5m">—</b></span>
-            <span class="lg lg-15m">15m <b id="taker-15m">—</b></span>
-            <span class="lg lg-1h">1h <b id="taker-1h">—</b></span>
-          </div>
-          <div class="taker-regime" id="taker-regime" data-regime="neutral">
-            <span class="rg-text" id="taker-regime-text">—</span>
-            <span class="rg-sub" id="taker-regime-sub"></span>
-          </div>
+
+      <!-- ICT Signal Panel -->
+      <div id="signal-panel"></div>
+
+      <!-- Funding Bar -->
+      <div id="funding-bar">
+        <div class="fund-stat">
+          <span class="fund-lbl">funding</span>
+          <span class="fund-val" id="fund-rate">—</span>
+          <span class="fund-sub" id="fund-countdown">next in —</span>
+        </div>
+        <div class="fund-stat">
+          <span class="fund-lbl">mark price</span>
+          <span class="fund-val" id="fund-mark">—</span>
+        </div>
+        <div class="fund-stat">
+          <span class="fund-lbl">24h volume</span>
+          <span class="fund-val" id="fund-volume">—</span>
+        </div>
+        <div class="fund-stat">
+          <span class="fund-lbl">interval</span>
+          <span class="fund-val" id="fund-interval">—</span>
         </div>
       </div>
-      <div id="funding-pane" class="funding-pane">
-        <div class="funding-stat">
-          <div class="stat-lbl">funding</div>
-          <div class="stat-val" id="fund-val">—</div>
-          <div class="stat-sub" id="fund-countdown">next in —</div>
-        </div>
-        <div class="funding-stat">
-          <div class="stat-lbl">open interest</div>
-          <div class="stat-val" id="oi-val">—</div>
-          <div class="stat-sub" id="oi-change">1h —</div>
-        </div>
-        <div class="funding-stat" id="basis-stat">
-          <div class="stat-lbl">spot − perp</div>
-          <div class="stat-val" id="basis-val">—</div>
-          <div class="stat-sub" id="basis-sub">leader —</div>
-        </div>
-        <div class="funding-stat" id="gex-stat">
-          <div class="stat-lbl">gex regime</div>
-          <div class="stat-val" id="gex-val">—</div>
-          <div class="stat-sub" id="gex-sub">flip —</div>
-        </div>
-        <div class="funding-stat funding-signal" id="funding-signal">
-          <div class="stat-lbl">signal</div>
-          <div class="signal-text" id="signal-text">NEUTRAL</div>
-          <div class="stat-sub" id="signal-sub">no setup</div>
-        </div>
-      </div>
+
     </main>
+
     <script src="/static/app.js"></script>
   </body>
 </html>

@@ -1,2161 +1,1009 @@
-const $ = (id) => document.getElementById(id);
+/* =========================================================
+   iX — Bitunix ICT Scalping Terminal
+   app.js — complete frontend logic
+   ========================================================= */
+'use strict';
 
-// Backend host (without protocol). Falls back to whatever served this page —
-// useful when the frontend is also served by FastAPI. Override via the
-// <meta name="ix-backend"> tag in index.html when deploying to Vercel etc.
-const BACKEND = (document.querySelector('meta[name="ix-backend"]')?.content || "").trim() || location.host;
-const HTTP = location.protocol === "https:" ? "https" : "http";
-const WS_PROTO = location.protocol === "https:" ? "wss" : "ws";
+// ─── Backend URL resolution ───────────────────────────────
+const _meta = document.querySelector('meta[name="ix-backend"]');
+const BACKEND_HOST = (_meta && _meta.content) ? _meta.content.trim() : location.host;
+const PROTO    = location.protocol === 'https:' ? 'https' : 'http';
+const WS_PROTO = location.protocol === 'https:' ? 'wss'   : 'ws';
+const API  = `${PROTO}://${BACKEND_HOST}`;
+const WS   = `${WS_PROTO}://${BACKEND_HOST}`;
 
-const state = {
-  symbol: localStorage.getItem("ix_symbol") || "BTCUSDT",
-  timeframe: localStorage.getItem("ix_timeframe") || "5m",
-  capabilities: {},          // per-symbol {spot, gex, heatmap}
-  ws: null,
-  priceChart: null,
-  cvdChart: null,
-  takerChart: null,
-  candleSeries: null,
-  cvdSeries: null,
-  takerSeries: { "5m": null, "15m": null, "1h": null },
-  takerBaseline: null,
-  takerWs: null,
-  lastDivergences: [],
-  takerDivMarker: null,
-  // Iceberg detection
-  icebergWs: null,
-  icebergLines: [],
-  // Anchored CVD
-  cvdData: [],          // [{time, value}] mirror of cvdSeries data
-  anchor: null,         // {time, price, cvd_value}
-  anchorPriceMarker: null,
-  anchoredCvdSeries: null,
-  token: "",
-};
+// ─── Auth ─────────────────────────────────────────────────
+const AUTH_KEY = 'ix_token';
+let TOKEN = localStorage.getItem(AUTH_KEY) || '';
 
-// Friendly display label for each perp symbol in the dropdown.
-const SYMBOL_LABEL = {
-  BTCUSDT: "BTC", ETHUSDT: "ETH", SOLUSDT: "SOL", HYPEUSDT: "HYPE",
-  ZECUSDT: "ZEC", TONUSDT: "TON", NEARUSDT: "NEAR", ONDOUSDT: "ONDO",
-  ENAUSDT: "ENA", MONUSDT: "MON", MEGAUSDT: "MEGA", OPUSDT: "OP",
-  BNBUSDT: "BNB", XMRUSDT: "XMR",
-};
+const authOverlay = document.getElementById('auth-overlay');
+const authForm    = document.getElementById('auth-form');
+const authInput   = document.getElementById('auth-input');
+const authError   = document.getElementById('auth-error');
 
-function symParam() {
-  return `&symbol=${encodeURIComponent(state.symbol)}`;
-}
-
-/* ============================================================
-   Symbol search + token meta
-   ============================================================ */
-
-const tokenMeta = {
-  current: null,        // last loaded meta object
-  refreshTimer: null,
-  searchAbort: null,
-  searchTimer: null,
-};
-
-function fmtTokenPrice(v) {
-  if (v == null || !isFinite(v) || v === 0) return "—";
-  if (v >= 1000)   return `$${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-  if (v >= 1)      return `$${v.toFixed(3)}`;
-  if (v >= 0.01)   return `$${v.toFixed(4)}`;
-  if (v >= 0.0001) return `$${v.toFixed(6)}`;
-  return `$${v.toExponential(3)}`;
-}
-function fmtVol(v) {
-  if (v == null || !isFinite(v)) return "—";
-  const a = Math.abs(v);
-  if (a >= 1e9) return `$${(v/1e9).toFixed(2)}B`;
-  if (a >= 1e6) return `$${(v/1e6).toFixed(2)}M`;
-  if (a >= 1e3) return `$${(v/1e3).toFixed(1)}K`;
-  return `$${v.toFixed(0)}`;
-}
-
-async function loadTokenMeta(symbol) {
+authForm.addEventListener('submit', async e => {
+  e.preventDefault();
+  const candidate = authInput.value.trim();
   try {
-    const r = await fetch(
-      `${HTTP}://${BACKEND}/api/symbols/meta?symbol=${encodeURIComponent(symbol)}`,
-      { headers: { "X-Auth-Token": state.token }, cache: "no-store", credentials: "omit" }
-    );
-    if (!r.ok) throw new Error(`meta ${r.status}`);
-    const meta = await r.json();
-    if (state.symbol !== symbol) return;   // user switched away
-    tokenMeta.current = meta;
-    renderTokenMeta(meta);
-    // Capabilities can vary per coin; refresh the per-symbol caps.
-    if (meta.capabilities) {
-      state.capabilities[symbol] = meta.capabilities;
-      applyCapabilities();
+    const r = await fetch(`${API}/api/auth/check`, {
+      headers: { 'X-Auth-Token': candidate }
+    });
+    if (r.ok) {
+      TOKEN = candidate;
+      localStorage.setItem(AUTH_KEY, TOKEN);
+      authOverlay.style.display = 'none';
+      document.querySelector('header').style.display = '';
+      document.querySelector('main').style.display   = '';
+      init();
+    } else {
+      authError.textContent = 'invalid token';
     }
-  } catch (e) {
-    // Soft-fail: meta isn't critical. Show base only.
-    console.warn("[meta]", e.message);
+  } catch {
+    authError.textContent = 'connection error';
+  }
+});
+
+document.getElementById('logout').addEventListener('click', () => {
+  localStorage.removeItem(AUTH_KEY);
+  TOKEN = '';
+  location.reload();
+});
+
+// Auto-check stored token
+(async () => {
+  if (!TOKEN) return;
+  try {
+    const r = await fetch(`${API}/api/auth/check`, {
+      headers: { 'X-Auth-Token': TOKEN }
+    });
+    if (r.ok) {
+      authOverlay.style.display = 'none';
+      document.querySelector('header').style.display = '';
+      document.querySelector('main').style.display   = '';
+      init();
+    } else {
+      TOKEN = '';
+      localStorage.removeItem(AUTH_KEY);
+    }
+  } catch { /* server down, show auth form */ }
+})();
+
+// ─── Global state ─────────────────────────────────────────
+let currentSymbol    = 'BTCUSDT';
+let currentTF        = '5m';
+let currentICT       = null;
+let currentSignals   = [];
+let candleWS         = null;
+let fundingWS        = null;
+let fundingData      = {};
+
+// ─── Chart instances ──────────────────────────────────────
+let chart        = null;
+let candleSeries = null;
+let overlayCanvas = null;
+
+// ─── DOM refs ─────────────────────────────────────────────
+const statusEl      = document.getElementById('status');
+const pxEl          = document.getElementById('px');
+const tokenLogo     = document.getElementById('token-logo');
+const tokenName     = document.getElementById('token-name');
+const tokenPrice    = document.getElementById('token-price');
+const tokenChange   = document.getElementById('token-change');
+const tokenVolume   = document.getElementById('token-volume');
+const tfsEl         = document.getElementById('tfs');
+const signalList    = document.getElementById('signal-list');
+const fundRate      = document.getElementById('fund-rate');
+const fundCountdown = document.getElementById('fund-countdown');
+const fundMark      = document.getElementById('fund-mark');
+
+// ─── ICT colour scheme ────────────────────────────────────
+const ICT = {
+  bullOB:       'rgba(0, 180, 90,  0.18)',
+  bullOBBorder: 'rgba(0, 220, 100, 0.70)',
+  bearOB:       'rgba(220, 40,  40, 0.18)',
+  bearOBBorder: 'rgba(255, 60,  60, 0.70)',
+  bullFVG:      'rgba(0, 200, 140, 0.12)',
+  bullFVGBorder:'rgba(0, 240, 160, 0.50)',
+  bearFVG:      'rgba(200, 50,  50, 0.12)',
+  bearFVGBorder:'rgba(240, 80,  80, 0.50)',
+  bullBOS:      '#00e676',
+  bearBOS:      '#ff1744',
+  bullCHoCH:    '#69f0ae',
+  bearCHoCH:    '#ff6d00',
+  eqh:          'rgba(220, 200, 60, 0.80)',
+  eql:          'rgba(60,  200, 220, 0.80)',
+  bsl:          'rgba(80,  140, 255, 0.65)',
+  ssl:          'rgba(255, 100, 80,  0.65)',
+  sweep:        'rgba(255, 215, 0,   0.90)',
+  premium:      'rgba(220, 50,  50,  0.06)',
+  discount:     'rgba(30,  180, 80,  0.06)',
+  displacement: 'rgba(255, 200, 0,   0.85)',
+};
+
+// ─── Init ─────────────────────────────────────────────────
+async function init() {
+  try {
+    const r = await fetch(`${API}/api/symbols?token=${TOKEN}`);
+    const data = await r.json();
+    currentSymbol = data.default || 'BTCUSDT';
+    buildTimeframePicker(data.timeframes || ['1m','5m','15m','1h','4h']);
+  } catch { buildTimeframePicker(['1m','5m','15m','1h','4h']); }
+
+  buildChart();
+  setupSymbolSearch();
+  connectCandle(currentSymbol, currentTF);
+  connectFunding(currentSymbol);
+  setupTradesModal();
+  setupAI();
+  updateTokenMeta();
+}
+
+// ─── Chart setup ──────────────────────────────────────────
+function buildChart() {
+  const container = document.getElementById('price');
+  container.style.position = 'relative';
+  container.innerHTML = '';
+
+  chart = LightweightCharts.createChart(container, {
+    layout: {
+      background:  { type: 'solid', color: '#080810' },
+      textColor:   '#666',
+      fontFamily:  "'JetBrains Mono', 'Fira Code', 'Courier New', monospace",
+      fontSize:    11,
+    },
+    grid: {
+      vertLines: { color: 'rgba(255,255,255,0.03)' },
+      horzLines: { color: 'rgba(255,255,255,0.03)' },
+    },
+    crosshair: {
+      mode: LightweightCharts.CrosshairMode.Normal,
+      vertLine: { color: 'rgba(255,255,255,0.15)', labelBackgroundColor: '#111120' },
+      horzLine: { color: 'rgba(255,255,255,0.15)', labelBackgroundColor: '#111120' },
+    },
+    rightPriceScale: {
+      borderColor: 'rgba(255,255,255,0.06)',
+      scaleMargins: { top: 0.08, bottom: 0.08 },
+    },
+    timeScale: {
+      borderColor: 'rgba(255,255,255,0.06)',
+      timeVisible: true,
+      secondsVisible: false,
+    },
+    handleScroll: { mouseWheel: true, pressedMouseMove: true },
+    handleScale:  { mouseWheel: true, pinch: true },
+    width:  container.clientWidth,
+    height: container.clientHeight,
+  });
+
+  candleSeries = chart.addCandlestickSeries({
+    upColor:        '#00e676',
+    downColor:      '#ff1744',
+    borderUpColor:  '#00e676',
+    borderDownColor:'#ff1744',
+    wickUpColor:    '#00e676',
+    wickDownColor:  '#ff1744',
+  });
+
+  // Overlay canvas for ICT zone rendering
+  overlayCanvas = document.createElement('canvas');
+  overlayCanvas.style.cssText =
+    'position:absolute;top:0;left:0;pointer-events:none;z-index:10;';
+  container.appendChild(overlayCanvas);
+  syncCanvas();
+
+  chart.timeScale().subscribeVisibleLogicalRangeChange(() => drawICT());
+  chart.subscribeCrosshairMove(() => drawICT());
+
+  const ro = new ResizeObserver(() => {
+    chart.applyOptions({
+      width:  container.clientWidth,
+      height: container.clientHeight,
+    });
+    syncCanvas();
+    drawICT();
+  });
+  ro.observe(container);
+}
+
+function syncCanvas() {
+  const c = document.getElementById('price');
+  overlayCanvas.width        = c.clientWidth;
+  overlayCanvas.height       = c.clientHeight;
+  overlayCanvas.style.width  = c.clientWidth  + 'px';
+  overlayCanvas.style.height = c.clientHeight + 'px';
+}
+
+// ─── Timeframe picker ─────────────────────────────────────
+function buildTimeframePicker(tfs) {
+  tfsEl.innerHTML = '';
+  tfs.forEach(tf => {
+    const btn = document.createElement('button');
+    btn.className  = 'tf-btn' + (tf === currentTF ? ' active' : '');
+    btn.textContent = tf;
+    btn.addEventListener('click', () => {
+      if (tf === currentTF) return;
+      currentTF = tf;
+      tfsEl.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      reconnectCandle();
+    });
+    tfsEl.appendChild(btn);
+  });
+}
+
+// ─── Symbol search ────────────────────────────────────────
+function setupSymbolSearch() {
+  const input   = document.getElementById('symbol-input');
+  const results = document.getElementById('symbol-results');
+  let debounce  = null;
+
+  input.addEventListener('input', () => {
+    clearTimeout(debounce);
+    const q = input.value.trim();
+    if (!q) { results.hidden = true; return; }
+    debounce = setTimeout(async () => {
+      try {
+        const r = await fetch(
+          `${API}/api/symbols/search?q=${encodeURIComponent(q)}&token=${TOKEN}`
+        );
+        const d = await r.json();
+        renderSearch(d.results || []);
+      } catch { results.hidden = true; }
+    }, 220);
+  });
+
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Escape') { results.hidden = true; input.blur(); }
+  });
+  document.addEventListener('click', e => {
+    if (!input.contains(e.target) && !results.contains(e.target))
+      results.hidden = true;
+  });
+
+  function renderSearch(items) {
+    results.innerHTML = '';
+    if (!items.length) { results.hidden = true; return; }
+    items.forEach(item => {
+      const div = document.createElement('div');
+      div.className = 'sr-item';
+      div.innerHTML =
+        `<span class="sr-sym">${item.symbol}</span>` +
+        `<span class="sr-name">${item.name}</span>`;
+      div.addEventListener('click', () => {
+        input.value = '';
+        results.hidden = true;
+        selectSymbol(item.symbol);
+      });
+      results.appendChild(div);
+    });
+    results.hidden = false;
   }
 }
 
-function renderTokenMeta(m) {
-  if (!m) return;
-  const logo = $("token-logo");
-  if (m.logo) { logo.src = m.logo; logo.style.display = ""; }
-  else { logo.removeAttribute("src"); logo.style.display = "none"; }
-  $("token-name").textContent = m.base || "—";
-  $("token-price").textContent = fmtTokenPrice(m.price);
-  const chg = Number(m.change_24h_pct || 0);
-  const chgEl = $("token-change");
-  chgEl.textContent = `${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%`;
-  chgEl.classList.toggle("up", chg > 0);
-  chgEl.classList.toggle("down", chg < 0);
-  $("token-volume").textContent = fmtVol(m.volume_24h_usd);
+async function selectSymbol(sym) {
+  currentSymbol = sym.toUpperCase();
+  reconnectCandle();
+  reconnectFunding();
+  updateTokenMeta();
 }
 
-function startTokenMetaRefresh() {
-  if (tokenMeta.refreshTimer) clearInterval(tokenMeta.refreshTimer);
-  tokenMeta.refreshTimer = setInterval(() => {
-    if (state.symbol) loadTokenMeta(state.symbol);
-  }, 8_000);
-}
-
-/* ----- search dropdown ----- */
-
-function renderSearchResults(results, query) {
-  const wrap = $("symbol-results");
-  if (!results || results.length === 0) {
-    wrap.innerHTML = `<div class="empty">${query ? `no Binance perp for "${query}"` : "type to search"}</div>`;
-    wrap.hidden = false;
-    return;
-  }
-  wrap.innerHTML = "";
-  for (const r of results) {
-    const row = document.createElement("div");
-    row.className = "symbol-row";
-    row.dataset.symbol = r.symbol;
-    const logoUrl = r.logo || "";
-    row.innerHTML = `
-      <img class="sym-logo" src="${logoUrl}" alt="" onerror="this.style.visibility='hidden'" />
-      <div class="sym-name">
-        <span class="sym-base">${r.base}</span>
-        <span class="sym-full">${r.name || ""}</span>
-      </div>
-      <span class="sym-rank">${r.rank ? `#${r.rank}` : ""}</span>
-    `;
-    row.onclick = () => {
-      switchSymbol(r.symbol);
-      $("symbol-input").value = "";
-      wrap.hidden = true;
-    };
-    wrap.appendChild(row);
-  }
-  wrap.hidden = false;
-}
-
-async function runSymbolSearch(query) {
-  query = query.trim();
-  if (!query) {
-    $("symbol-results").hidden = true;
-    return;
-  }
-  // Abort any in-flight search
-  if (tokenMeta.searchAbort) tokenMeta.searchAbort.abort();
-  const ctl = new AbortController();
-  tokenMeta.searchAbort = ctl;
+async function updateTokenMeta() {
   try {
     const r = await fetch(
-      `${HTTP}://${BACKEND}/api/symbols/search?q=${encodeURIComponent(query)}`,
-      { headers: { "X-Auth-Token": state.token }, signal: ctl.signal, credentials: "omit" }
+      `${API}/api/symbols/meta?symbol=${currentSymbol}&token=${TOKEN}`
     );
     if (!r.ok) return;
-    const data = await r.json();
-    renderSearchResults(data.results || [], query);
-  } catch (e) {
-    if (e.name !== "AbortError") console.warn("[search]", e.message);
+    const d = await r.json();
+    tokenName.textContent  = d.base || currentSymbol;
+    tokenPrice.textContent = fmt(d.price);
+    const chg = parseFloat(d.change_24h_pct || 0);
+    tokenChange.textContent = (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%';
+    tokenChange.className   = 'token-change ' + (chg >= 0 ? 'up' : 'down');
+    tokenVolume.textContent = fmtVol(d.volume_24h_usd);
+    if (d.logo) { tokenLogo.src = d.logo; tokenLogo.style.display = ''; }
+    else tokenLogo.style.display = 'none';
+  } catch { /* ignore */ }
+}
+
+// ─── WebSocket connections ────────────────────────────────
+function connectCandle(sym, tf) {
+  if (candleWS) { try { candleWS.close(); } catch{} candleWS = null; }
+  setStatus('connecting');
+
+  const url = `${WS}/ws/${sym}/${tf}?token=${TOKEN}`;
+  candleWS   = new WebSocket(url);
+
+  candleWS.onopen    = () => setStatus('live');
+  candleWS.onmessage = e => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+    if (msg.event === 'ping') return;
+    handleCandleMessage(msg);
+  };
+  candleWS.onclose = () => {
+    setStatus('disconnected');
+    setTimeout(() => {
+      if (currentSymbol === sym && currentTF === tf) connectCandle(sym, tf);
+    }, 3000);
+  };
+  candleWS.onerror = () => setStatus('error');
+}
+
+function connectFunding(sym) {
+  if (fundingWS) { try { fundingWS.close(); } catch{} fundingWS = null; }
+  const url  = `${WS}/ws/funding?symbol=${sym}&token=${TOKEN}`;
+  fundingWS  = new WebSocket(url);
+  fundingWS.onmessage = e => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+    if (msg.event === 'ping') return;
+    handleFundingMessage(msg);
+  };
+  fundingWS.onclose = () => {
+    setTimeout(() => {
+      if (currentSymbol === sym) connectFunding(sym);
+    }, 5000);
+  };
+}
+
+function reconnectCandle() {
+  currentICT     = null;
+  currentSignals = [];
+  if (candleSeries) candleSeries.setData([]);
+  clearOverlay();
+  clearSignals();
+  connectCandle(currentSymbol, currentTF);
+}
+
+function reconnectFunding() {
+  connectFunding(currentSymbol);
+}
+
+// ─── Candle message handling ──────────────────────────────
+function handleCandleMessage(msg) {
+  const { event, data } = msg;
+  if (event === 'snapshot') { loadSnapshot(data); return; }
+  if (event === 'tick' || event === 'candle') { updateCandle(data); return; }
+  if (event === 'ict')     { currentICT = data; drawICT(); return; }
+  if (event === 'signals') {
+    currentSignals = Array.isArray(data) ? data : [];
+    renderSignals();
+    return;
   }
 }
 
-function initSymbolSearch() {
-  const input = $("symbol-input");
-  const wrap = $("symbol-results");
-  input.addEventListener("input", () => {
-    if (tokenMeta.searchTimer) clearTimeout(tokenMeta.searchTimer);
-    tokenMeta.searchTimer = setTimeout(() => runSymbolSearch(input.value), 180);
+function loadSnapshot(data) {
+  const candles = (data.candles || []).map(c => ({
+    time:  Math.floor(c.ts / 1000),
+    open:  c.open,
+    high:  c.high,
+    low:   c.low,
+    close: c.close,
+  }));
+  if (candles.length) {
+    candleSeries.setData(candles);
+    chart.timeScale().fitContent();
+    pxEl.textContent = fmt(candles[candles.length - 1].close);
+  }
+  if (data.ict)     { currentICT     = data.ict;    drawICT(); }
+  if (data.signals) { currentSignals = data.signals; renderSignals(); }
+}
+
+function updateCandle(c) {
+  candleSeries.update({
+    time:  Math.floor(c.ts / 1000),
+    open:  c.open,
+    high:  c.high,
+    low:   c.low,
+    close: c.close,
   });
-  input.addEventListener("focus", () => {
-    if (input.value.trim()) runSymbolSearch(input.value);
-  });
-  input.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") {
-      input.blur();
-      wrap.hidden = true;
-    } else if (e.key === "Enter") {
-      const first = wrap.querySelector(".symbol-row");
-      if (first) first.click();
-    }
-  });
-  document.addEventListener("click", (e) => {
-    if (!input.contains(e.target) && !wrap.contains(e.target)) {
-      wrap.hidden = true;
-    }
-  });
+  pxEl.textContent = fmt(c.close);
 }
 
-/* ---------- symbol switching ---------- */
+// ─── Funding message handling ─────────────────────────────
+function handleFundingMessage(msg) {
+  const cur = msg.event === 'snapshot' ? msg.data.current : msg.data;
+  if (!cur) return;
+  fundingData = cur;
 
-function caps() {
-  // Conservative defaults: assume only perp + spot are likely; GEX is BTC/ETH
-  // only and heatmap depends on Coinalyze coverage. Once /api/symbols/meta
-  // returns we replace this with the real caps for the symbol.
-  return state.capabilities[state.symbol] || { spot: true, gex: false, heatmap: false };
+  const rate = parseFloat(cur.funding_rate || 0);
+  fundRate.textContent = (rate * 100).toFixed(4) + '%';
+  fundRate.className   = 'fund-val ' + (rate > 0 ? 'pos' : rate < 0 ? 'neg' : '');
+
+  if (cur.next_funding_time) {
+    const ms  = cur.next_funding_time - Date.now();
+    const hrs = Math.max(0, Math.floor(ms / 3600000));
+    const min = Math.max(0, Math.floor((ms % 3600000) / 60000));
+    fundCountdown.textContent = `next ${hrs}h ${String(min).padStart(2,'0')}m`;
+  }
+  if (cur.mark_price) fundMark.textContent = fmt(cur.mark_price);
 }
 
-function applyCapabilities() {
-  const c = caps();
-  // Keep the funding-bar grid stable across symbols — show explicit
-  // "unavailable" placeholders for missing data sources rather than
-  // hiding columns and leaving empty grid tracks.
-  const basisStat = $("basis-stat");
-  if (basisStat) {
-    basisStat.classList.toggle("disabled", !c.spot);
-    if (!c.spot) {
-      $("basis-val").textContent = "n/a";
-      $("basis-sub").textContent = "no spot pair";
+// ─── ICT overlay drawing ──────────────────────────────────
+function clearOverlay() {
+  if (!overlayCanvas) return;
+  const ctx = overlayCanvas.getContext('2d');
+  ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+}
+
+function drawICT() {
+  if (!overlayCanvas || !candleSeries || !currentICT) { clearOverlay(); return; }
+  syncCanvas();
+  const ctx = overlayCanvas.getContext('2d');
+  ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
+  const W   = overlayCanvas.width;
+  const ts  = chart.timeScale();
+  const now = Math.floor(Date.now() / 1000);
+  const ict = currentICT;
+
+  function py(price)  {
+    const v = candleSeries.priceToCoordinate(price);
+    return (v != null && isFinite(v)) ? v : null;
+  }
+  function tx(timeS)  {
+    const v = ts.timeToCoordinate(timeS);
+    return (v != null && isFinite(v)) ? v : null;
+  }
+  function txNow()    { return tx(now) ?? W; }
+
+  ctx.font      = '10px "JetBrains Mono", monospace';
+  ctx.textAlign = 'left';
+
+  // ── Premium / Discount background ──────────────────────
+  const pd = ict.premium_discount;
+  if (pd && pd.range_high && pd.range_low && pd.equilibrium) {
+    const yH = py(pd.range_high);
+    const yE = py(pd.equilibrium);
+    const yL = py(pd.range_low);
+
+    if (yH != null && yE != null) {
+      ctx.fillStyle = ICT.premium;
+      ctx.fillRect(0, Math.min(yH, yE), W, Math.abs(yE - yH));
     }
-  }
-  const gexStat = $("gex-stat");
-  if (gexStat) {
-    gexStat.classList.toggle("disabled", !c.gex);
-    gexStat.dataset.state = c.gex ? "neutral" : "neutral";
-    if (!c.gex) {
-      $("gex-val").textContent = "n/a";
-      $("gex-sub").textContent = "no options market";
+    if (yE != null && yL != null) {
+      ctx.fillStyle = ICT.discount;
+      ctx.fillRect(0, Math.min(yE, yL), W, Math.abs(yL - yE));
     }
-  }
-  const liqBtn = $("liq-toggle");
-  if (liqBtn) {
-    liqBtn.disabled = !c.heatmap;
-    liqBtn.title = c.heatmap
-      ? "toggle liquidation heatmap"
-      : "heatmap unavailable for this symbol";
-  }
-}
-
-function resetSymbolViews() {
-  if (state.candleSeries) state.candleSeries.setData([]);
-  if (state.cvdSeries) state.cvdSeries.setData([]);
-  if (state.basisSeries) state.basisSeries.setData([]);
-  if (state.takerAnchorSeries) state.takerAnchorSeries.setData([]);
-  for (const tf of ["5m", "15m", "1h"]) {
-    if (state.takerSeries[tf]) state.takerSeries[tf].setData([]);
-  }
-  // Paper trade lines are only relevant on BTC.
-  for (const id of Object.keys(paper.lines || {})) removeTradeLines(Number(id));
-  // Drop iceberg lines + anchor from previous symbol.
-  clearIcebergLines();
-  clearAnchor();
-  // Drop divergence markers from the previous symbol.
-  if (state.candleSeries && state.candleSeries.setMarkers) state.candleSeries.setMarkers([]);
-  // Reset readouts.
-  ["px", "cvd", "delta", "fund-val", "oi-val", "basis-val", "gex-val", "taker-5m", "taker-15m", "taker-1h"].forEach((id) => {
-    const el = $(id);
-    if (el) el.textContent = "—";
-  });
-  const dEl = $("delta"); if (dEl) dEl.style.color = "";
-  if ($("oi-change")) $("oi-change").textContent = "1h —";
-  if ($("fund-countdown")) $("fund-countdown").textContent = "next in —";
-  if ($("basis-sub")) $("basis-sub").textContent = "leader —";
-  if ($("gex-sub")) $("gex-sub").textContent = "flip —";
-  // Composite signal back to neutral.
-  state.lastFundingSig = "neutral";
-  state.lastTakerRegime = "neutral";
-  state.lastGex = null;
-  if (typeof recomputeSignal === "function") recomputeSignal();
-  // Heatmap canvas
-  if (typeof drawHeatmap === "function") {
-    state.liqSnapshot = null;
-    drawHeatmap();
-  }
-}
-
-function closeSymbolWses() {
-  for (const k of ["ws", "fundingWs", "basisWs", "takerWs", "gexWs", "liveLiqWs", "liqWs", "icebergWs"]) {
-    const ws = state[k];
-    if (ws) {
-      // Null onclose so the auto-reconnect timer doesn't fire on stale symbol.
-      ws.onclose = null;
-      try { ws.close(); } catch {}
-      state[k] = null;
+    // 50% equilibrium line
+    if (yE != null) {
+      ctx.strokeStyle = 'rgba(180,180,180,0.30)';
+      ctx.setLineDash([4, 6]);
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(0, yE); ctx.lineTo(W, yE); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = 'rgba(180,180,180,0.50)';
+      ctx.fillText('EQ 50%', 5, yE - 4);
+    }
+    // 62% / 38% fibs
+    if (pd.fib_618) {
+      const y618 = py(pd.fib_618);
+      if (y618 != null) {
+        ctx.strokeStyle = 'rgba(220,80,80,0.25)';
+        ctx.setLineDash([2,8]); ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(0, y618); ctx.lineTo(W, y618); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = 'rgba(220,80,80,0.50)';
+        ctx.fillText('62% Premium', 5, y618 - 4);
+      }
+    }
+    if (pd.fib_382) {
+      const y382 = py(pd.fib_382);
+      if (y382 != null) {
+        ctx.strokeStyle = 'rgba(40,180,80,0.25)';
+        ctx.setLineDash([2,8]); ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(0, y382); ctx.lineTo(W, y382); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = 'rgba(40,180,80,0.50)';
+        ctx.fillText('38% Discount', 5, y382 + 12);
+      }
     }
   }
-}
 
-function reconnectAllForSymbol() {
-  const c = caps();
-  connect();             // /ws/{symbol}/{timeframe}
-  connectFunding();
-  if (c.spot) connectBasis();
-  connectTaker();
-  if (c.gex) connectGex();
-  connectLiveLiq();
-  connectIceberg();
-  if (state.liqVisible && c.heatmap) connectLiquidations();
-}
+  // ── Session levels ──────────────────────────────────────
+  const SESS_COLOR = {
+    asia:     'rgba(140,80,220,0.55)',
+    london:   'rgba(80,160,220,0.55)',
+    ny:       'rgba(220,160,40,0.55)',
+    prev_day: 'rgba(180,180,180,0.45)',
+  };
+  const SESS_LABEL = { asia:'AS', london:'LN', ny:'NY', prev_day:'PD' };
 
-function switchSymbol(newSym) {
-  if (!newSym || newSym === state.symbol) return;
-  state.symbol = newSym;
-  localStorage.setItem("ix_symbol", newSym);
-  closeSymbolWses();
-  resetSymbolViews();
-  applyCapabilities();
-  reconnectAllForSymbol();
-  // Refresh the paper-trade form preview (button label, liq estimate) since
-  // they depend on the current symbol's mark price.
-  if (typeof updateTradePreview === "function") updateTradePreview();
-  // Pull token metadata for the new coin (logo, price, 24h vol, capabilities).
-  loadTokenMeta(newSym);
-}
-
-async function verifyToken(token) {
-  if (!token) return false;
-  try {
-    const r = await fetch(`${HTTP}://${BACKEND}/api/auth/check`, {
-      headers: { "X-Auth-Token": token },
-      cache: "no-store",
-      credentials: "omit",
+  for (const [sess, levels] of Object.entries(ict.sessions || {})) {
+    const col = SESS_COLOR[sess] || 'rgba(180,180,180,0.4)';
+    const lbl = SESS_LABEL[sess] || sess.toUpperCase();
+    ['high','low'].forEach(hl => {
+      if (!levels[hl]) return;
+      const y = py(levels[hl]);
+      if (y == null) return;
+      ctx.strokeStyle = col; ctx.setLineDash([3,6]); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = col;
+      ctx.fillText(`${lbl}${hl[0].toUpperCase()}`, 5, hl === 'high' ? y - 3 : y + 11);
     });
-    return r.ok;
-  } catch {
-    return false;
+  }
+
+  // ── Sell-side / Buy-side liquidity lines ────────────────
+  const liq = ict.liquidity || {};
+  for (const lvl of (liq.sell_side || [])) {
+    const y = py(lvl.price);
+    if (y == null) continue;
+    ctx.strokeStyle = ICT.ssl; ctx.setLineDash([2,7]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  for (const lvl of (liq.buy_side || [])) {
+    const y = py(lvl.price);
+    if (y == null) continue;
+    ctx.strokeStyle = ICT.bsl; ctx.setLineDash([2,7]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // ── Equal Highs / Equal Lows ────────────────────────────
+  for (const eq of (ict.equal_levels || [])) {
+    const y = py(eq.price);
+    if (y == null) continue;
+    const isH = eq.type === 'EQH';
+    ctx.strokeStyle = isH ? ICT.eqh : ICT.eql;
+    ctx.setLineDash([5, 4]); ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = ctx.strokeStyle;
+    ctx.textAlign = 'right';
+    ctx.fillText(`${eq.type}×${eq.count}`, W - 4, y - 3);
+    ctx.textAlign = 'left';
+  }
+
+  // ── Liquidity Sweeps ────────────────────────────────────
+  for (const sw of (liq.sweeps || [])) {
+    const x = tx(Math.floor(sw.ts / 1000));
+    const y = py(sw.price);
+    if (x == null || y == null) continue;
+    // Ring
+    ctx.strokeStyle = ICT.sweep; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(x, y, 6, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = ICT.sweep;
+    const arrow = sw.direction === 'bullish' ? '▲' : '▼';
+    ctx.fillText(`${arrow}SWEEP`, x + 10, y + 4);
+  }
+
+  // ── Order Blocks ────────────────────────────────────────
+  for (const ob of (ict.order_blocks || [])) {
+    const xL = tx(Math.floor(ob.ts / 1000));
+    const xR = txNow();
+    const yT = py(ob.top);
+    const yB = py(ob.bottom);
+    if (xL == null || yT == null || yB == null) continue;
+
+    const x1 = Math.max(0, xL);
+    const x2 = Math.min(W + 80, xR);
+    const y1 = Math.min(yT, yB);
+    const y2 = Math.max(yT, yB);
+
+    const isBull = ob.type === 'bullish';
+    ctx.fillStyle   = isBull ? ICT.bullOB        : ICT.bearOB;
+    ctx.strokeStyle = isBull ? ICT.bullOBBorder  : ICT.bearOBBorder;
+    ctx.lineWidth   = ob.strength >= 80 ? 1.5 : 1;
+    ctx.setLineDash([]);
+    ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+
+    // Mid line
+    const yMid = py(ob.mid);
+    if (yMid != null) {
+      ctx.strokeStyle = isBull ? 'rgba(0,220,100,0.30)' : 'rgba(255,60,60,0.30)';
+      ctx.setLineDash([2,4]); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x1, yMid); ctx.lineTo(x2, yMid); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // Label
+    ctx.fillStyle = isBull ? ICT.bullOBBorder : ICT.bearOBBorder;
+    ctx.font      = 'bold 9px monospace';
+    ctx.fillText(`OB ${ob.strength}`, x1 + 3, y1 + 11);
+    ctx.font      = '10px monospace';
+
+    // Mitigation diagonal hatch
+    if (ob.mitigated) {
+      ctx.strokeStyle = 'rgba(180,180,180,0.20)';
+      ctx.lineWidth = 1; ctx.setLineDash([2,5]);
+      for (let yy = y1 + 6; yy < y2; yy += 9) {
+        ctx.beginPath(); ctx.moveTo(x1, yy); ctx.lineTo(x2, yy); ctx.stroke();
+      }
+      ctx.setLineDash([]);
+    }
+  }
+
+  // ── Fair Value Gaps ─────────────────────────────────────
+  for (const fvg of (ict.fvgs || [])) {
+    const xL = tx(Math.floor(fvg.ts / 1000));
+    const xR = txNow();
+    const yT = py(fvg.top);
+    const yB = py(fvg.bottom);
+    if (xL == null || yT == null || yB == null) continue;
+
+    const x1 = Math.max(0, xL);
+    const x2 = Math.min(W + 80, xR);
+    const y1 = Math.min(yT, yB);
+    const y2 = Math.max(yT, yB);
+    const isBull = fvg.type === 'bullish';
+    const fp     = fvg.filled_pct || 0;
+
+    ctx.fillStyle   = isBull ? ICT.bullFVG        : ICT.bearFVG;
+    ctx.strokeStyle = isBull ? ICT.bullFVGBorder  : ICT.bearFVGBorder;
+    ctx.setLineDash([3,3]); ctx.lineWidth = 1;
+    ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+    ctx.setLineDash([]);
+
+    // Fill progress overlay
+    if (fp > 0) {
+      const fillH = (y2 - y1) * fp;
+      ctx.fillStyle = isBull ? 'rgba(0,220,140,0.14)' : 'rgba(220,50,50,0.14)';
+      ctx.fillRect(x1, isBull ? y2 - fillH : y1, x2 - x1, fillH);
+    }
+
+    ctx.fillStyle = isBull ? ICT.bullFVGBorder : ICT.bearFVGBorder;
+    ctx.font      = '9px monospace';
+    ctx.fillText(`FVG${fp > 0 ? ' ' + Math.round(fp*100) + '%' : ''}`, x1 + 3, y1 + 11);
+    ctx.font = '10px monospace';
+  }
+
+  // ── BOS / CHoCH structure events ────────────────────────
+  const events = (ict.structure || {}).events || [];
+  for (const evt of events.slice(-20)) {
+    const x = tx(Math.floor(evt.ts / 1000));
+    const y = py(evt.price);
+    if (x == null || y == null) continue;
+
+    const isBull = evt.direction === 'bullish';
+    const isBOS  = evt.type === 'BOS';
+    const color  = isBull
+      ? (isBOS ? ICT.bullBOS  : ICT.bullCHoCH)
+      : (isBOS ? ICT.bearBOS  : ICT.bearCHoCH);
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth   = isBOS ? 1.5 : 1.2;
+    ctx.setLineDash(isBOS ? [] : [3,3]);
+    ctx.beginPath();
+    ctx.moveTo(Math.max(0, x - 80), y);
+    ctx.lineTo(Math.min(W, x + 5), y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.fillStyle = color;
+    ctx.font      = `bold ${isBOS ? 10 : 9}px monospace`;
+    ctx.fillText(evt.type, Math.max(2, x - 78), y - 3);
+    ctx.font = '10px monospace';
+  }
+
+  // ── Swing High / Low dots ───────────────────────────────
+  const swings = (ict.structure || {}).swings || {};
+  for (const s of (swings.highs || [])) {
+    const x = tx(Math.floor(s.ts / 1000));
+    const y = py(s.price);
+    if (x == null || y == null) continue;
+    ctx.fillStyle = 'rgba(255,100,80,0.70)';
+    ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill();
+  }
+  for (const s of (swings.lows || [])) {
+    const x = tx(Math.floor(s.ts / 1000));
+    const y = py(s.price);
+    if (x == null || y == null) continue;
+    ctx.fillStyle = 'rgba(0,220,130,0.70)';
+    ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // ── Displacement markers ─────────────────────────────────
+  for (const d of (ict.displacement || [])) {
+    const x = tx(Math.floor(d.ts / 1000));
+    if (x == null) continue;
+    const y1 = py(d.high);
+    const y2 = py(d.low);
+    if (y1 == null || y2 == null) continue;
+    ctx.strokeStyle = ICT.displacement;
+    ctx.lineWidth   = 2.5;
+    ctx.beginPath(); ctx.moveTo(x, y1); ctx.lineTo(x, y2); ctx.stroke();
+    ctx.fillStyle = ICT.displacement;
+    ctx.font = 'bold 9px monospace';
+    ctx.fillText('D', x - 4, d.direction === 'bullish' ? y2 + 12 : y1 - 5);
+    ctx.font = '10px monospace';
   }
 }
 
-function showError(msg) {
-  $("auth-error").textContent = msg || "";
+// ─── Signal panel ─────────────────────────────────────────
+function clearSignals() {
+  if (signalList)
+    signalList.innerHTML = '<div class="sig-empty">awaiting data…</div>';
 }
 
-async function ensureAuth() {
-  const overlay = $("auth-overlay");
-  const hideOverlay = () => { if (overlay) overlay.style.display = "none"; };
+function renderSignals() {
+  if (!signalList) return;
+  if (!currentSignals || !currentSignals.length) {
+    signalList.innerHTML =
+      '<div class="sig-empty">no ICT setup detected — waiting for confluence…</div>';
+    return;
+  }
+  signalList.innerHTML = '';
+  for (const sig of currentSignals) {
+    const card     = document.createElement('div');
+    const conf     = sig.confidence || 0;
+    const confCls  = conf >= 65 ? 'conf-high' : conf >= 45 ? 'conf-mid' : 'conf-low';
+    const sweepBdg = sig.sweep_warning
+      ? '<span class="sweep-badge">⚡ SWEEP</span>' : '';
+    const rrTxt    = sig.rr ? `<span class="sig-rr">RR ${sig.rr}</span>` : '';
+    card.className = `sig-card sig-${sig.type}`;
+    card.innerHTML = `
+      <div class="sig-header">
+        <span class="sig-type">${sigTypeLabel(sig.type)}</span>
+        ${sweepBdg}
+        <span class="sig-conf ${confCls}">${conf}<span class="conf-unit">%</span></span>
+      </div>
+      ${rrTxt}
+      <div class="sig-factors">${
+        (sig.factors || []).slice(0, 4)
+          .map(f => `<div class="sig-factor">· ${f}</div>`).join('')
+      }</div>
+      <div class="sig-reason">${sig.reason || ''}</div>
+    `;
+    signalList.appendChild(card);
+  }
+}
 
-  // If a token is already stored, trust it immediately and hide the overlay.
-  // No network call on refresh. WS connections will close with 4401 if the
-  // token is bad, and reconnect logic re-tries — never auto-logging out.
-  const stored = localStorage.getItem("ix_token") || "";
-  if (stored) {
-    hideOverlay();
-    return stored;
+function sigTypeLabel(type) {
+  return {
+    long_setup:    '⬆ LONG SETUP',
+    short_setup:   '⬇ SHORT SETUP',
+    long_watch:    '↗ LONG WATCH',
+    short_watch:   '↘ SHORT WATCH',
+    sweep_warning: '⚡ SWEEP WARNING',
+  }[type] || type.replace(/_/g,' ').toUpperCase();
+}
+
+// ─── Status ───────────────────────────────────────────────
+function setStatus(s) {
+  statusEl.textContent = s;
+  statusEl.className   = 'status status-' + s.replace(/\s/g, '');
+}
+
+// ─── Paper trades modal ───────────────────────────────────
+function setupTradesModal() {
+  const btn   = document.getElementById('my-trades-btn');
+  const modal = document.getElementById('trades-modal');
+  if (!btn || !modal) return;
+  modal.querySelectorAll('[data-close]')
+    .forEach(el => el.addEventListener('click', () => { modal.hidden = true; }));
+  btn.addEventListener('click', () => { modal.hidden = false; refreshPaper(); });
+
+  const UID_KEY = 'ix_uid';
+  let UID = localStorage.getItem(UID_KEY);
+  if (!UID) { UID = crypto.randomUUID(); localStorage.setItem(UID_KEY, UID); }
+
+  const sideToggle  = modal.querySelectorAll('.side-btn');
+  const sizeInp     = document.getElementById('trade-size');
+  const levInp      = document.getElementById('trade-leverage');
+  const levDisp     = document.getElementById('lev-display');
+  const openBtn     = document.getElementById('open-trade-btn');
+  const tradeErr    = document.getElementById('trade-error');
+  const resetBtn    = document.getElementById('reset-account');
+  let   activeSide  = 'long';
+
+  sideToggle.forEach(b => b.addEventListener('click', () => {
+    sideToggle.forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    activeSide = b.dataset.side;
+    openBtn.textContent = `OPEN ${activeSide.toUpperCase()}`;
+    openBtn.className   = `primary-btn ${activeSide}`;
+    updateTradeSummary();
+  }));
+  levInp.addEventListener('input', () => {
+    levDisp.textContent = levInp.value + 'x';
+    updateTradeSummary();
+  });
+  sizeInp.addEventListener('input', updateTradeSummary);
+
+  function updateTradeSummary() {
+    const size = parseFloat(sizeInp.value) || 0;
+    const lev  = parseFloat(levInp.value)  || 1;
+    const mark = parseFloat((fundMark.textContent || '').replace(/,/g,'')) || 0;
+    document.getElementById('trade-margin').textContent   = '$' + (size / lev).toFixed(2);
+    document.getElementById('trade-notional').textContent = '$' + size.toFixed(2);
+    document.getElementById('trade-mark').textContent     = mark ? fmt(mark) : '—';
+    if (mark) {
+      const liq = activeSide === 'long'
+        ? mark * (1 - 1/lev * 0.85)
+        : mark * (1 + 1/lev * 0.85);
+      document.getElementById('trade-liq').textContent = fmt(Math.max(0, liq));
+    }
   }
 
-  return new Promise((resolve) => {
-    const form = $("auth-form");
-    const input = $("auth-input");
-    overlay.style.display = "flex";
-    setTimeout(() => input.focus(), 50);
-    form.onsubmit = async (e) => {
-      e.preventDefault();
-      const t = input.value.trim();
-      showError("");
-      if (!t) return;
-      if (await verifyToken(t)) {
-        localStorage.setItem("ix_token", t);
-        hideOverlay();
-        resolve(t);
-      } else {
-        showError("invalid token");
-        input.value = "";
-        input.focus();
+  openBtn.addEventListener('click', async () => {
+    tradeErr.textContent = '';
+    const size = parseFloat(sizeInp.value);
+    const lev  = parseFloat(levInp.value);
+    if (!size || size <= 0) { tradeErr.textContent = 'enter size'; return; }
+    try {
+      const r = await fetch(`${API}/api/paper/open`, {
+        method:  'POST',
+        headers: { 'X-Auth-Token': TOKEN, 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ uid: UID, symbol: currentSymbol,
+                                  side: activeSide, size_usd: size, leverage: lev }),
+      });
+      if (!r.ok) { tradeErr.textContent = (await r.json()).detail || 'error'; return; }
+      await refreshPaper();
+    } catch (err) { tradeErr.textContent = String(err); }
+  });
+
+  resetBtn.addEventListener('click', async () => {
+    await fetch(`${API}/api/paper/reset`, {
+      method:  'POST',
+      headers: { 'X-Auth-Token': TOKEN, 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ uid: UID }),
+    });
+    await refreshPaper();
+  });
+
+  async function refreshPaper() {
+    try {
+      const [accR, trR] = await Promise.all([
+        fetch(`${API}/api/paper/account?uid=${UID}&token=${TOKEN}`),
+        fetch(`${API}/api/paper/trades?uid=${UID}&token=${TOKEN}`),
+      ]);
+      const acc    = await accR.json();
+      const trades = (await trR.json()).trades || [];
+      const open   = trades.filter(t => t.status === 'open');
+      const closed = trades.filter(t => t.status !== 'open');
+
+      document.getElementById('modal-balance').textContent    = '$' + (acc.balance||0).toFixed(2);
+      document.getElementById('modal-equity').textContent     = '$' + (acc.equity||0).toFixed(2);
+      document.getElementById('modal-unrealized').textContent = '$' + (acc.unrealized_pnl||0).toFixed(2);
+      document.getElementById('balance').textContent          = '$' + (acc.balance||0).toFixed(2);
+      const badge = document.getElementById('open-pos-count');
+      badge.textContent = open.length; badge.hidden = open.length === 0;
+      document.getElementById('active-count').textContent = `(${open.length})`;
+
+      document.getElementById('active-trades').innerHTML = open.map(t => `
+        <div class="trade-row">
+          <span class="tr-sym">${t.symbol}</span>
+          <span class="tr-side tr-${t.side}">${t.side.toUpperCase()}</span>
+          <span class="tr-lev">${t.leverage}x</span>
+          <span class="tr-entry">${fmt(t.entry_price)}</span>
+          <span class="tr-notional">$${t.size_usd.toFixed(0)}</span>
+          <span class="tr-pnl ${(acc.open_pnl?.[t.id]||0)>=0?'up':'down'}">
+            ${(acc.open_pnl?.[t.id]||0)>=0?'+':''}$${(acc.open_pnl?.[t.id]||0).toFixed(2)}
+          </span>
+          <button class="close-trade-btn" data-id="${t.id}">✕</button>
+        </div>`).join('') || '<div class="no-trades">no open positions</div>';
+
+      document.getElementById('active-trades').querySelectorAll('.close-trade-btn')
+        .forEach(btn => btn.addEventListener('click', async () => {
+          await fetch(`${API}/api/paper/close`, {
+            method:  'POST',
+            headers: { 'X-Auth-Token': TOKEN, 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ uid: UID, trade_id: parseInt(btn.dataset.id) }),
+          });
+          await refreshPaper();
+        }));
+
+      document.getElementById('trade-history').innerHTML = closed.slice(0,20).map(t => `
+        <div class="trade-row compact">
+          <span class="tr-sym">${t.symbol}</span>
+          <span class="tr-side tr-${t.side}">${t.side[0].toUpperCase()}</span>
+          <span>${fmt(t.entry_price)} → ${t.close_price ? fmt(t.close_price) : '—'}</span>
+          <span class="tr-pnl ${(t.pnl_usd||0)>=0?'up':'down'}">
+            ${(t.pnl_usd||0)>=0?'+':''}$${(t.pnl_usd||0).toFixed(2)}
+          </span>
+        </div>`).join('') || '<div class="no-trades">no history</div>';
+    } catch { /* ignore */ }
+  }
+}
+
+// ─── AI modal ─────────────────────────────────────────────
+function setupAI() {
+  const aiBtn  = document.getElementById('ai-btn');
+  const modal  = document.getElementById('ai-modal');
+  if (!aiBtn || !modal) return;
+
+  modal.querySelectorAll('[data-close]')
+    .forEach(el => el.addEventListener('click', () => {
+      modal.hidden = true;
+      if (aiWS) { aiWS.close(); aiWS = null; }
+    }));
+  aiBtn.addEventListener('click', () => {
+    modal.hidden = false;
+    document.getElementById('ai-symbol-display').textContent = currentSymbol;
+    document.getElementById('ai-intro').hidden   = false;
+    document.getElementById('ai-running').hidden = true;
+    document.getElementById('ai-result').hidden  = true;
+  });
+
+  let aiWS = null;
+  const runBtn   = document.getElementById('ai-run-btn');
+  const rerunBtn = document.getElementById('ai-rerun-btn');
+  [runBtn, rerunBtn].forEach(b => b && b.addEventListener('click', startAnalysis));
+
+  function startAnalysis() {
+    document.getElementById('ai-intro').hidden   = true;
+    document.getElementById('ai-running').hidden = false;
+    document.getElementById('ai-result').hidden  = true;
+    document.getElementById('ai-stream').textContent  = '';
+    document.getElementById('ai-answer').textContent  = '';
+    document.getElementById('ai-answer-head').hidden  = true;
+    document.getElementById('ai-status').textContent  = 'initializing…';
+    document.querySelectorAll('.ai-phases li')
+      .forEach(li => li.removeAttribute('data-active'));
+
+    if (aiWS) aiWS.close();
+    aiWS = new WebSocket(
+      `${WS}/ws/ai-analysis?symbol=${currentSymbol}&token=${TOKEN}`
+    );
+    aiWS.onopen    = () => aiWS.send(JSON.stringify({ action: 'start' }));
+    aiWS.onmessage = e => {
+      try { handleAIMsg(JSON.parse(e.data)); } catch { /* ignore */ }
+    };
+    aiWS.onclose = () => {
+      if (!document.getElementById('ai-running').hidden) {
+        document.getElementById('ai-running').hidden = true;
+        document.getElementById('ai-result').hidden  = false;
       }
     };
-  });
-}
-
-function logout() {
-  localStorage.removeItem("ix_token");
-  if (state.ws) { state.ws.onclose = null; state.ws.close(); }
-  if (state.fundingWs) { state.fundingWs.onclose = null; state.fundingWs.close(); }
-  if (state.liqWs) { state.liqWs.onclose = null; state.liqWs.close(); }
-  if (state.basisWs) { state.basisWs.onclose = null; state.basisWs.close(); }
-  if (state.liveLiqWs) { state.liveLiqWs.onclose = null; state.liveLiqWs.close(); }
-  location.reload();
-}
-
-/* ---------- Funding / OI panel ---------- */
-
-function fmtFunding(rate) {
-  if (rate === null || rate === undefined || Number.isNaN(rate)) return "—";
-  // Funding rate comes as a fraction (e.g. -0.0001 = -0.01%). Show as %.
-  const pct = rate * 100;
-  const sign = pct >= 0 ? "+" : "";
-  return `${sign}${pct.toFixed(4)}%`;
-}
-
-function fmtOI(usd) {
-  if (!usd) return "—";
-  if (usd >= 1e9) return `$${(usd / 1e9).toFixed(2)}B`;
-  if (usd >= 1e6) return `$${(usd / 1e6).toFixed(1)}M`;
-  return `$${Math.round(usd).toLocaleString()}`;
-}
-
-function fmtCountdown(nextTs) {
-  if (!nextTs) return "next in —";
-  const diff = nextTs - Date.now();
-  if (diff <= 0) return "settling…";
-  const h = Math.floor(diff / 3_600_000);
-  const m = Math.floor((diff % 3_600_000) / 60_000);
-  return `next in ${h}h ${m.toString().padStart(2, "0")}m`;
-}
-
-function applyFunding(c) {
-  if (!c) return;
-  state.lastFunding = c;
-  const fundEl = $("fund-val");
-  fundEl.textContent = fmtFunding(c.funding_rate);
-  fundEl.style.color =
-    c.funding_rate > 0 ? "var(--up)" :
-    c.funding_rate < 0 ? "var(--down)" : "var(--fg)";
-
-  $("fund-countdown").textContent = fmtCountdown(c.next_funding_time);
-
-  $("oi-val").textContent = fmtOI(c.oi_value);
-  const chg = c.oi_change_1h || 0;
-  const chgPct = (chg * 100).toFixed(2);
-  const oiSub = $("oi-change");
-  oiSub.textContent = `1h ${chg >= 0 ? "+" : ""}${chgPct}%`;
-  oiSub.style.color = chg > 0 ? "var(--up)" : chg < 0 ? "var(--down)" : "var(--mute)";
-
-  state.lastFundingSig = c.signal || "neutral";
-  recomputeSignal();
-}
-
-/* ---------- Composite signal: funding + taker + GEX ---------- */
-
-const SIG_LABEL = {
-  explosive_long:  { text: "EXPLOSIVE LONG",   sub: "vol expansion + bull flow + shorts trapped" },
-  explosive_short: { text: "EXPLOSIVE SHORT",  sub: "vol expansion + bear flow + longs trapped" },
-  breakout_long:   { text: "BREAKOUT ↑",  sub: "buyers pressing pinned range — break imminent" },
-  breakout_short:  { text: "BREAKOUT ↓",  sub: "sellers pressing pinned range — break imminent" },
-  pinned:          { text: "PINNED",           sub: "vol suppressed in dealer zone" },
-  explosive:       { text: "EXPLOSIVE VOL",    sub: "no directional confirmation yet" },
-  squeeze:         { text: "SQUEEZE",          sub: "shorts trapped — bullish" },
-  flush:           { text: "FLUSH",            sub: "longs trapped — bearish" },
-  neutral:         { text: "NEUTRAL",          sub: "no setup" },
-};
-
-function recomputeSignal() {
-  const f  = state.lastFundingSig || "neutral";
-  const t  = state.lastTakerRegime || "neutral";
-  const gs = state.lastGex?.state || "neutral";
-
-  const bullStrong = t === "bull_strong";
-  const bearStrong = t === "bear_strong";
-
-  let sig;
-  // Highest conviction first: vol regime + flow + funding all aligned.
-  if (gs === "explosive" && bullStrong && f === "squeeze") sig = "explosive_long";
-  else if (gs === "explosive" && bearStrong && f === "flush") sig = "explosive_short";
-  // Pinning + strong directional taker = pressure building against the pin.
-  else if (gs === "pinning" && bullStrong) sig = "breakout_long";
-  else if (gs === "pinning" && bearStrong) sig = "breakout_short";
-  // GEX regime alone (no taker / funding confirmation).
-  else if (gs === "pinning")   sig = "pinned";
-  else if (gs === "explosive") sig = "explosive";
-  // Fall back to funding-only signals when GEX is neutral.
-  else if (f === "squeeze") sig = "squeeze";
-  else if (f === "flush")   sig = "flush";
-  else                       sig = "neutral";
-
-  const lbl = SIG_LABEL[sig];
-  const sigBox = $("funding-signal");
-  if (sigBox && sigBox.dataset.state !== sig) sigBox.dataset.state = sig;
-  const txtEl = $("signal-text");
-  const subEl = $("signal-sub");
-  if (txtEl) txtEl.textContent = lbl.text;
-  if (subEl) subEl.textContent = lbl.sub;
-}
-
-/* ---------- Options Gamma Exposure (GEX) ---------- */
-
-function applyGex(snap) {
-  if (!snap) return;
-  state.lastGex = snap;
-  const stat = $("gex-stat");
-  if (stat) stat.dataset.state = snap.state || "neutral";
-  const valEl = $("gex-val");
-  const subEl = $("gex-sub");
-  if (valEl) {
-    valEl.textContent =
-      snap.state === "pinning"   ? "PINNING"   :
-      snap.state === "explosive" ? "EXPLOSIVE" : "NEUTRAL";
   }
-  if (subEl) {
-    subEl.textContent = snap.flip_zone
-      ? `flip $${(snap.flip_zone / 1000).toFixed(1)}k`
-      : "flip —";
-  }
-  recomputeSignal();
-}
 
-function connectGex() {
-  if (state.gexWs) {
-    state.gexWs.onclose = null;
-    state.gexWs.close();
-  }
-  const url = `${WS_PROTO}://${BACKEND}/ws/gex?token=${encodeURIComponent(state.token)}${symParam()}`;
-  const ws = new WebSocket(url);
-  state.gexWs = ws;
-  ws.onmessage = (m) => {
-    const msg = JSON.parse(m.data);
-    if (msg.event === "snapshot" || msg.event === "tick") applyGex(msg.data);
-  };
-  ws.onclose = () => setTimeout(connectGex, 5000);
-}
-
-let fundingCountdownTimer = null;
-
-function connectFunding() {
-  if (state.fundingWs) {
-    state.fundingWs.onclose = null;
-    state.fundingWs.close();
-  }
-  const url = `${WS_PROTO}://${BACKEND}/ws/funding?token=${encodeURIComponent(state.token)}${symParam()}`;
-  const ws = new WebSocket(url);
-  state.fundingWs = ws;
-  ws.onmessage = (m) => {
-    const msg = JSON.parse(m.data);
-    if (msg.event === "snapshot") applyFunding(msg.data.current);
-    else if (msg.event === "tick") applyFunding(msg.data);
-  };
-  ws.onclose = () => setTimeout(connectFunding, 2000);
-
-  // Refresh the countdown text once a minute (the rate itself updates every 30s via WS).
-  if (fundingCountdownTimer) clearInterval(fundingCountdownTimer);
-  fundingCountdownTimer = setInterval(() => {
-    const txt = $("fund-countdown").textContent;
-    if (!txt.startsWith("next in")) return;
-    // we don't have the timestamp here; re-apply via cached state
-    if (state.lastFunding) $("fund-countdown").textContent = fmtCountdown(state.lastFunding.next_funding_time);
-  }, 30_000);
-}
-
-const chartOpts = {
-  layout: { background: { color: "#0a0a0a" }, textColor: "#999" },
-  grid: { vertLines: { color: "#141414" }, horzLines: { color: "#141414" } },
-  // Fixed minimum width on the right scale so the time-axis pixel grid is
-  // identical across all panes — without this, panes drift sideways when
-  // axis labels differ in width.
-  rightPriceScale: { borderColor: "#1c1c1c", minimumWidth: 64 },
-  timeScale: {
-    borderColor: "#1c1c1c",
-    timeVisible: true,
-    secondsVisible: false,
-    shiftVisibleRangeOnNewBar: false, // don't yank the user when a new bar arrives
-    rightOffset: 4,
-  },
-  crosshair: { mode: 1 },
-};
-
-function buildCharts() {
-  if (state.priceChart) state.priceChart.remove();
-  if (state.cvdChart) state.cvdChart.remove();
-  if (state.takerChart) state.takerChart.remove();
-
-  state.priceChart = LightweightCharts.createChart($("price"), chartOpts);
-  state.candleSeries = state.priceChart.addCandlestickSeries({
-    upColor: "#26a69a", downColor: "#ef5350",
-    borderUpColor: "#26a69a", borderDownColor: "#ef5350",
-    wickUpColor: "#26a69a", wickDownColor: "#ef5350",
-  });
-
-  state.cvdChart = LightweightCharts.createChart($("cvd-pane"), {
-    ...chartOpts,
-    timeScale: { ...chartOpts.timeScale, visible: false },
-  });
-  state.cvdSeries = state.cvdChart.addLineSeries({
-    color: "#d4d4d4", lineWidth: 2, priceLineVisible: false,
-  });
-
-  // Basis histogram in the CVD pane — same time axis, separate overlay
-  // scale anchored to the bottom 28% so it never crowds the CVD line.
-  state.basisSeries = state.cvdChart.addHistogramSeries({
-    priceScaleId: "basis",
-    priceFormat: { type: "price", precision: 4, minMove: 0.0001 },
-    base: 0,
-    lastValueVisible: false,
-    priceLineVisible: false,
-  });
-  state.cvdChart.priceScale("basis").applyOptions({
-    scaleMargins: { top: 0.75, bottom: 0 },
-    visible: false,
-  });
-  // Keep CVD line in the top 75% so it never overlaps the basis bars.
-  state.cvdChart.priceScale("right").applyOptions({
-    scaleMargins: { top: 0.05, bottom: 0.28 },
-  });
-
-  // Taker pane — 3 lines (5m / 15m / 1h ratio) + 0.5 baseline
-  state.takerChart = LightweightCharts.createChart($("taker-pane"), {
-    ...chartOpts,
-    timeScale: { ...chartOpts.timeScale, visible: false },
-  });
-  state.takerSeries["5m"]  = state.takerChart.addLineSeries({
-    color: "#26a69a", lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
-  });
-  state.takerSeries["15m"] = state.takerChart.addLineSeries({
-    color: "#f5b942", lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
-  });
-  state.takerSeries["1h"]  = state.takerChart.addLineSeries({
-    color: "#c97cf4", lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
-  });
-  // 0.5 = neutral baseline. Above = buyers aggressive, below = sellers aggressive.
-  state.takerSeries["5m"].createPriceLine({
-    price: 0.5, color: "#3a3a3a", lineStyle: 0, lineWidth: 1, axisLabelVisible: true, title: "0.5",
-  });
-  state.takerChart.priceScale("right").applyOptions({
-    scaleMargins: { top: 0.15, bottom: 0.15 },
-    autoScale: true,
-  });
-
-  // Hidden anchor series on the taker pane: an invisible line populated with
-  // every price-candle timestamp. This forces the taker chart's time grid to
-  // match the price chart's logical bar index exactly — without it, sparse
-  // 1h bars would make logical-range sync blow up the scale.
-  state.takerAnchorSeries = state.takerChart.addLineSeries({
-    color: "rgba(0,0,0,0)",
-    priceScaleId: "anchor",
-    lastValueVisible: false,
-    priceLineVisible: false,
-    crosshairMarkerVisible: false,
-  });
-  state.takerChart.priceScale("anchor").applyOptions({ visible: false });
-
-  // Sync time scales between panes by LOGICAL bar index. Works because every
-  // pane shares the same time grid (price candles → cvd whitespace fill,
-  // taker anchor series). Guarded to prevent feedback loops.
-  const charts = [state.priceChart, state.cvdChart, state.takerChart];
-  let syncing = false;
-  const broadcast = (src) => src.timeScale().subscribeVisibleLogicalRangeChange((r) => {
-    if (!r || syncing) return;
-    syncing = true;
-    try {
-      for (const c of charts) {
-        if (c !== src) c.timeScale().setVisibleLogicalRange(r);
-      }
-    } finally { syncing = false; }
-  });
-  charts.forEach(broadcast);
-
-  const onResize = () => {
-    state.priceChart.applyOptions({ width: $("price").clientWidth, height: $("price").clientHeight });
-    state.cvdChart.applyOptions({ width: $("cvd-pane").clientWidth, height: $("cvd-pane").clientHeight });
-    state.takerChart.applyOptions({ width: $("taker-pane").clientWidth, height: $("taker-pane").clientHeight });
-    resizeLiqCanvas();
-    drawHeatmap();
-  };
-  ensureLiqCanvas();
-  onResize();
-  window.addEventListener("resize", onResize);
-
-  // Repaint the heatmap whenever the price chart's visible price range changes
-  // (zoom, pan, autoscale). Lightweight Charts doesn't expose a single event
-  // for price-range changes, so we hook the time scale + a rAF loop guard.
-  state.priceChart.timeScale().subscribeVisibleTimeRangeChange(() => drawHeatmap());
-  state.candleSeries.subscribeDataChanged?.(() => drawHeatmap());
-}
-
-function setStatus(s, cls) {
-  const el = $("status");
-  el.textContent = s;
-  el.className = "status " + (cls || "");
-}
-
-function fmt(n, d = 2) {
-  if (n === null || n === undefined || Number.isNaN(n)) return "—";
-  return Number(n).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
-}
-
-function applySnapshot(candles, divergences) {
-  if (candles.length) state.lastPrice = candles[candles.length - 1].close;
-  const cs = candles.map((c) => ({
-    time: Math.floor(c.ts / 1000),
-    open: c.open, high: c.high, low: c.low, close: c.close,
-  }));
-  // Same time index as price for perfect alignment. Unobserved bars become
-  // WhitespaceData ({ time }) so the CVD line breaks across gaps but the time
-  // scale stays in sync with the price pane.
-  const ds = candles.map((c) => {
-    const time = Math.floor(c.ts / 1000);
-    return c.observed ? { time, value: c.cvd } : { time };
-  });
-  state.candleSeries.setData(cs);
-  state.cvdSeries.setData(ds);
-  // Mirror CVD data so anchored CVD can read historical values without
-  // touching the chart series internals.
-  state.cvdData = ds.filter((d) => d.value !== undefined).map((d) => ({ time: d.time, value: d.value }));
-  // Anchor the taker pane to the same time grid so logical-range sync works.
-  if (state.takerAnchorSeries) {
-    state.takerAnchorSeries.setData(cs.map((c) => ({ time: c.time })));
-  }
-  applyDivergences(divergences || []);
-  refreshAnchoredCvd();
-
-  // When the symbol changes the previous coin's price range is meaningless
-  // for the new coin (BTC at 80k vs ETH at 3.5k). Auto-fit and re-enable
-  // autoScale so the latest candles are visible immediately. If the user
-  // is still on the same symbol (mid-session reconnect), preserve their zoom.
-  if (state.lastSnapshotSymbol !== state.symbol) {
-    state.lastSnapshotSymbol = state.symbol;
-    try {
-      state.priceChart.priceScale("right").applyOptions({ autoScale: true });
-      state.cvdChart.priceScale("right").applyOptions({ autoScale: true });
-      state.priceChart.timeScale().fitContent();
-      state.cvdChart.timeScale().fitContent();
-      if (state.takerChart) state.takerChart.timeScale().fitContent();
-    } catch {}
-  }
-}
-
-function applyDivergences(divs) {
-  const markers = divs.map((d) => ({
-    time: Math.floor(d.ts / 1000),
-    position: d.type === "bearish" ? "aboveBar" : "belowBar",
-    color: d.type === "bearish" ? "#ef5350" : "#26a69a",
-    shape: d.type === "bearish" ? "arrowDown" : "arrowUp",
-    text: d.type === "bearish" ? "BEAR DIV" : "BULL DIV",
-  }));
-  state.candleSeries.setMarkers(markers);
-}
-
-function applyTick(c) {
-  const t = Math.floor(c.ts / 1000);
-  state.candleSeries.update({ time: t, open: c.open, high: c.high, low: c.low, close: c.close });
-  // Keep CVD time index aligned with price: emit whitespace when not observed,
-  // a real value once a trade has been seen.
-  state.cvdSeries.update(c.observed ? { time: t, value: c.cvd } : { time: t });
-  // Extend the taker pane's time grid in lockstep with price.
-  if (state.takerAnchorSeries) state.takerAnchorSeries.update({ time: t });
-  // Mirror CVD point and update anchored CVD if active.
-  if (c.observed) {
-    if (state.cvdData.length && state.cvdData[state.cvdData.length - 1].time === t) {
-      state.cvdData[state.cvdData.length - 1].value = c.cvd;
-    } else {
-      state.cvdData.push({ time: t, value: c.cvd });
-    }
-    if (state.anchor) updateAnchoredCvdLatest();
-  }
-  state.lastPrice = c.close;
-  $("px").textContent = fmt(c.close);
-  $("cvd").textContent = fmt(c.cvd, 0);
-  const d = c.delta;
-  const dEl = $("delta");
-  dEl.textContent = (d >= 0 ? "+" : "") + fmt(d, 0);
-  dEl.style.color = d >= 0 ? "var(--up)" : "var(--down)";
-}
-
-function connect() {
-  if (state.ws) {
-    state.ws.onclose = null;
-    state.ws.close();
-  }
-  setStatus("connecting");
-  const url = `${WS_PROTO}://${BACKEND}/ws/${state.symbol}/${state.timeframe}?token=${encodeURIComponent(state.token)}`;
-  const ws = new WebSocket(url);
-  state.ws = ws;
-  ws.onopen = () => setStatus("live", "live");
-  ws.onclose = () => {
-    setStatus("disconnected", "dead");
-    setTimeout(connect, 1500);
-  };
-  ws.onerror = () => setStatus("error", "dead");
-  ws.onmessage = (m) => {
-    const msg = JSON.parse(m.data);
-    if (msg.event === "snapshot") applySnapshot(msg.data.candles, msg.data.divergences);
-    else if (msg.event === "tick" || msg.event === "candle") applyTick(msg.data);
-    else if (msg.event === "divergences") applyDivergences(msg.data);
-  };
-}
-
-/* ---------- Spot vs Perp basis ---------- */
-
-function fmtBasisUsd(v) {
-  if (v === null || v === undefined || Number.isNaN(v)) return "—";
-  const sign = v >= 0 ? "+" : "−";
-  const abs = Math.abs(v);
-  return `${sign}$${abs.toFixed(2)}`;
-}
-
-function fmtBasisPct(v) {
-  if (v === null || v === undefined || Number.isNaN(v)) return "—";
-  const sign = v >= 0 ? "+" : "−";
-  return `${sign}${Math.abs(v).toFixed(4)}%`;
-}
-
-function applyBasis(c) {
-  if (!c) return;
-  state.lastBasis = c;
-  const valEl = $("basis-val");
-  valEl.textContent = `${fmtBasisUsd(c.basis)} (${fmtBasisPct(c.basis_pct)})`;
-  valEl.style.color =
-    c.basis > 0 ? "var(--up)" :
-    c.basis < 0 ? "var(--down)" : "var(--fg)";
-  const sub = $("basis-sub");
-  const leader =
-    c.state === "spot_led" ? "spot leading — real demand" :
-    c.state === "perp_led" ? "perp leading — leverage driven" :
-                              "balanced";
-  sub.textContent = leader;
-  sub.style.color =
-    c.state === "spot_led" ? "var(--up)" :
-    c.state === "perp_led" ? "var(--down)" : "var(--mute)";
-}
-
-function setBasisSeriesData(history) {
-  if (!state.basisSeries || !history) return;
-  // Histogram data sorted by time, colored by sign. Use basis_pct so the
-  // overlay scales sensibly across different price regimes.
-  const seen = new Set();
-  const data = [];
-  for (const p of history) {
-    const t = Math.floor(p.ts);
-    if (seen.has(t)) continue; // dedupe identical timestamps
-    seen.add(t);
-    data.push({
-      time: t,
-      value: p.basis_pct,
-      color: p.basis_pct >= 0
-        ? "rgba(38, 166, 154, 0.55)"
-        : "rgba(239, 83, 80, 0.55)",
-    });
-  }
-  data.sort((a, b) => a.time - b.time);
-  state.basisSeries.setData(data);
-}
-
-function pushBasisSample(sample) {
-  if (!state.basisSeries || !sample) return;
-  state.basisSeries.update({
-    time: Math.floor(sample.ts),
-    value: sample.basis_pct,
-    color: sample.basis_pct >= 0
-      ? "rgba(38, 166, 154, 0.55)"
-      : "rgba(239, 83, 80, 0.55)",
-  });
-}
-
-function connectBasis() {
-  if (state.basisWs) {
-    state.basisWs.onclose = null;
-    state.basisWs.close();
-  }
-  const url = `${WS_PROTO}://${BACKEND}/ws/basis?token=${encodeURIComponent(state.token)}${symParam()}`;
-  const ws = new WebSocket(url);
-  state.basisWs = ws;
-  ws.onmessage = (m) => {
-    const msg = JSON.parse(m.data);
-    if (msg.event === "snapshot") {
-      applyBasis(msg.data.current);
-      setBasisSeriesData(msg.data.history || []);
-    } else if (msg.event === "tick") {
-      applyBasis(msg.data);
-    } else if (msg.event === "sample") {
-      pushBasisSample(msg.data);
-    }
-  };
-  ws.onclose = () => setTimeout(connectBasis, 2000);
-}
-
-/* ---------- Taker buy/sell ratio ---------- */
-
-const REGIME_LABEL = {
-  bull_strong: { text: "STRONG BULL FLOW", sub: "all timeframes aggressive buys" },
-  bull:        { text: "BULL FLOW",         sub: "buyers aggressive across TFs" },
-  bear_strong: { text: "STRONG BEAR FLOW", sub: "all timeframes aggressive sells" },
-  bear:        { text: "BEAR FLOW",         sub: "sellers aggressive across TFs" },
-  diverging:   { text: "DIVERGING",         sub: "timeframes disagree — fade or wait" },
-  neutral:     { text: "NEUTRAL",           sub: "balanced flow" },
-};
-
-function fmtTaker(v) {
-  if (v === null || v === undefined || Number.isNaN(v)) return "—";
-  return Number(v).toFixed(3);
-}
-
-function applyTakerLegend(snap) {
-  if (!snap || !snap.tfs) return;
-  for (const tf of ["5m", "15m", "1h"]) {
-    const t = snap.tfs[tf];
-    const el = $(`taker-${tf}`);
-    if (!el || !t) continue;
-    const v = t.ema ?? t.ratio;
-    el.textContent = fmtTaker(v);
-    el.style.color =
-      v == null ? "var(--fg)" :
-      v >= 0.5  ? "var(--up)" : "var(--down)";
-    // Real-time line update — paint the in-progress bar's current ratio so the
-    // line extends with each kline tick, not just on bar close.
-    if (state.takerSeries[tf] && t.ts != null && t.ratio != null) {
-      state.takerSeries[tf].update({
-        time: Math.floor(t.ts / 1000),
-        value: t.ratio,
+  function handleAIMsg(msg) {
+    if (msg.event === 'phase') {
+      document.getElementById('ai-status').textContent = msg.label || msg.phase;
+      document.querySelectorAll('.ai-phases li').forEach(li => {
+        li.removeAttribute('data-active');
+        if (li.dataset.phase === msg.phase) li.setAttribute('data-active','1');
       });
     }
-  }
-  const reg = snap.regime || "neutral";
-  state.lastTakerRegime = reg;
-  recomputeSignal();
-  const lbl = REGIME_LABEL[reg] || REGIME_LABEL.neutral;
-  const wrap = $("taker-regime");
-  wrap.dataset.regime = reg;
-  $("taker-regime-text").textContent = lbl.text;
-  // If a divergence is active, override the sub line — it's the real signal.
-  if (snap.divergence) {
-    $("taker-regime-sub").textContent =
-      (snap.divergence.type === "bullish" ? "BULL DIV" : "BEAR DIV") +
-      " · " + snap.divergence.note;
-  } else {
-    $("taker-regime-sub").textContent = lbl.sub;
-  }
-}
-
-function takerSeriesData(history) {
-  // history per TF -> array of {ts, ratio} -> {time, value} dedup + sorted
-  const out = {};
-  for (const tf of ["5m", "15m", "1h"]) {
-    const seen = new Set();
-    const data = [];
-    for (const b of (history?.[tf] || [])) {
-      const t = Math.floor(b.ts / 1000);
-      if (seen.has(t)) continue;
-      seen.add(t);
-      data.push({ time: t, value: b.ratio });
+    if (msg.event === 'thinking_delta') {
+      const el = document.getElementById('ai-stream');
+      el.textContent += msg.text; el.scrollTop = el.scrollHeight;
     }
-    data.sort((a, b) => a.time - b.time);
-    out[tf] = data;
-  }
-  return out;
-}
-
-function applyTakerSnapshot(snap) {
-  if (!snap) return;
-  const data = takerSeriesData(snap.history || {});
-  for (const tf of ["5m", "15m", "1h"]) {
-    if (state.takerSeries[tf]) state.takerSeries[tf].setData(data[tf]);
-  }
-  applyTakerLegend(snap.current);
-}
-
-function applyTakerBar(payload) {
-  // payload: { tf, ts, ratio, ema, qv, close }
-  const s = state.takerSeries[payload.tf];
-  if (!s) return;
-  s.update({ time: Math.floor(payload.ts / 1000), value: payload.ratio });
-}
-
-function connectTaker() {
-  if (state.takerWs) {
-    state.takerWs.onclose = null;
-    state.takerWs.close();
-  }
-  const url = `${WS_PROTO}://${BACKEND}/ws/taker?token=${encodeURIComponent(state.token)}${symParam()}`;
-  const ws = new WebSocket(url);
-  state.takerWs = ws;
-  ws.onmessage = (m) => {
-    const msg = JSON.parse(m.data);
-    if (msg.event === "snapshot") {
-      applyTakerSnapshot(msg.data);
-    } else if (msg.event === "bar") {
-      applyTakerBar(msg.data);
-    } else if (msg.event === "tick") {
-      applyTakerLegend(msg.data);
+    if (msg.event === 'content_delta') {
+      document.getElementById('ai-answer-head').hidden = false;
+      const el = document.getElementById('ai-answer');
+      el.textContent += msg.text; el.scrollTop = el.scrollHeight;
     }
-  };
-  ws.onclose = () => setTimeout(connectTaker, 2000);
-}
-
-/* ---------- Live liquidation flash labels ---------- */
-
-function showLiqFlash(ev) {
-  if (!state.candleSeries) return;
-  const pane = $("price");
-  const y = state.candleSeries.priceToCoordinate(ev.price);
-  if (y == null || isNaN(y)) return;
-
-  const w = pane.clientWidth;
-  const h = pane.clientHeight;
-
-  const el = document.createElement("div");
-  el.className = "liq-flash " + (ev.side === "long" ? "long" : "short");
-  const arrow = ev.side === "long" ? "▼" : "▲";
-  const lbl = ev.side === "long" ? "LONG REKT" : "SHORT REKT";
-  el.textContent = `${arrow} ${fmtUsd(ev.usd)} ${lbl}`;
-  pane.appendChild(el);
-
-  // Place near right edge but not over the price scale; offset on overlap
-  const dpr = state.lastPrice && ev.price > state.lastPrice ? -22 : 12;
-  let top = Math.round(y + dpr);
-  // De-overlap with recent labels at similar Y
-  const near = (state._liqFlashes || []).filter(f => Math.abs(f.top - top) < 22);
-  if (near.length) top += near.length * 22 * (ev.side === "long" ? 1 : -1);
-  // Clamp inside pane
-  if (top < 4) top = 4;
-  if (top > h - 24) top = h - 24;
-
-  const lw = el.offsetWidth || 140;
-  let left = w - lw - 14;
-  if (left < 8) left = 8;
-  el.style.left = left + "px";
-  el.style.top = top + "px";
-
-  state._liqFlashes = state._liqFlashes || [];
-  const entry = { el, top, until: Date.now() + 2400 };
-  state._liqFlashes.push(entry);
-
-  setTimeout(() => {
-    el.remove();
-    state._liqFlashes = state._liqFlashes.filter(f => f !== entry);
-  }, 2500);
-}
-
-function connectLiveLiq() {
-  if (state.liveLiqWs) {
-    state.liveLiqWs.onclose = null;
-    state.liveLiqWs.close();
-  }
-  const url = `${WS_PROTO}://${BACKEND}/ws/live-liq?token=${encodeURIComponent(state.token)}${symParam()}`;
-  const ws = new WebSocket(url);
-  state.liveLiqWs = ws;
-  ws.onmessage = (m) => {
-    try {
-      const msg = JSON.parse(m.data);
-      if (msg.event === "liq") showLiqFlash(msg.data);
-    } catch {}
-  };
-  ws.onclose = () => {
-    state.liveLiqWs = null;
-    setTimeout(connectLiveLiq, 3000);
-  };
-  ws.onerror = () => {};
-}
-
-/* ---------- Liquidation heatmap ---------- */
-
-function ensureLiqCanvas() {
-  if (state.liqCanvas) return state.liqCanvas;
-  const pane = $("price");
-  const c = document.createElement("canvas");
-  c.className = "liq-canvas";
-  if (!state.liqVisible) c.classList.add("hidden");
-  pane.appendChild(c);
-  state.liqCanvas = c;
-
-  const tip = document.createElement("div");
-  tip.className = "liq-tooltip";
-  pane.appendChild(tip);
-  state.liqTooltip = tip;
-
-  pane.addEventListener("mousemove", onLiqHover);
-  pane.addEventListener("mouseleave", hideLiqTooltip);
-
-  resizeLiqCanvas();
-  return c;
-}
-
-function fmtUsd(v) {
-  if (!v) return "$0";
-  if (v >= 1e9) return `$${(v / 1e9).toFixed(2)}B`;
-  if (v >= 1e6) return `$${(v / 1e6).toFixed(2)}M`;
-  if (v >= 1e3) return `$${(v / 1e3).toFixed(1)}K`;
-  return `$${Math.round(v).toLocaleString()}`;
-}
-
-function hideLiqTooltip() {
-  if (state.liqTooltip) state.liqTooltip.classList.remove("show");
-}
-
-function onLiqHover(e) {
-  const tip = state.liqTooltip;
-  if (!tip) return;
-  if (!state.liqVisible || !state.liqHeatmap || !state.candleSeries) return hideLiqTooltip();
-  const data = state.liqHeatmap;
-  if (!data.buckets || data.buckets.length === 0) return hideLiqTooltip();
-
-  const pane = $("price");
-  const rect = pane.getBoundingClientRect();
-  const x = e.clientX - rect.left;
-  const y = e.clientY - rect.top;
-
-  const price = state.candleSeries.coordinateToPrice(y);
-  if (price == null || isNaN(price)) return hideLiqTooltip();
-
-  const bs = data.bucket_size;
-  // Closest bucket whose [price - bs/2, price + bs/2] contains hovered price
-  let bucket = null;
-  let bestDist = Infinity;
-  for (const b of data.buckets) {
-    const d = Math.abs(b.price - price);
-    if (d <= bs / 2 && d < bestDist) { bestDist = d; bucket = b; }
-  }
-  if (!bucket) return hideLiqTooltip();
-
-  const total = bucket.long_usd + bucket.short_usd;
-  const priceLo = bucket.price - bs / 2;
-  const priceHi = bucket.price + bs / 2;
-  tip.innerHTML = `
-    <div class="row"><span class="lbl">level</span><span>${fmt(priceLo, 0)} – ${fmt(priceHi, 0)}</span></div>
-    <div class="row"><span class="lbl">longs</span><span class="long">${fmtUsd(bucket.long_usd)}</span></div>
-    <div class="row"><span class="lbl">shorts</span><span class="short">${fmtUsd(bucket.short_usd)}</span></div>
-    <div class="row"><span class="lbl">total</span><span>${fmtUsd(total)}</span></div>
-  `;
-  tip.classList.add("show");
-
-  // Position near cursor, clamped to pane
-  let lx = x + 14, ly = y + 14;
-  const lw = tip.offsetWidth, lh = tip.offsetHeight;
-  if (lx + lw > rect.width - 4) lx = x - lw - 14;
-  if (ly + lh > rect.height - 4) ly = y - lh - 14;
-  if (lx < 4) lx = 4;
-  if (ly < 4) ly = 4;
-  tip.style.left = lx + "px";
-  tip.style.top = ly + "px";
-}
-
-function resizeLiqCanvas() {
-  const c = state.liqCanvas;
-  if (!c) return;
-  const pane = $("price");
-  const w = pane.clientWidth;
-  const h = pane.clientHeight;
-  const dpr = window.devicePixelRatio || 1;
-  c.width = Math.floor(w * dpr);
-  c.height = Math.floor(h * dpr);
-  c.style.width = w + "px";
-  c.style.height = h + "px";
-  const ctx = c.getContext("2d");
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-}
-
-let _heatmapRafPending = false;
-function drawHeatmap() {
-  if (_heatmapRafPending) return;
-  _heatmapRafPending = true;
-  requestAnimationFrame(() => {
-    _heatmapRafPending = false;
-    _drawHeatmap();
-  });
-}
-
-function _drawHeatmap() {
-  const c = state.liqCanvas;
-  if (!c || !state.liqVisible) return;
-  const ctx = c.getContext("2d");
-  const w = c.clientWidth;
-  const h = c.clientHeight;
-  ctx.clearRect(0, 0, w, h);
-
-  const data = state.liqHeatmap;
-  if (!data || !data.buckets || data.buckets.length === 0 || !data.max_usd) return;
-  if (!state.candleSeries) return;
-
-  const bucketSize = data.bucket_size;
-  const maxBarPx = Math.max(40, Math.floor(w * 0.32));
-  const lastClose = state.lastPrice ?? null;
-
-  // Pre-compute coordinates and skip buckets outside the visible price range.
-  const visibleTop = state.candleSeries.coordinateToPrice(0);
-  const visibleBot = state.candleSeries.coordinateToPrice(h);
-  const pMin = Math.min(visibleTop ?? Infinity, visibleBot ?? Infinity);
-  const pMax = Math.max(visibleTop ?? -Infinity, visibleBot ?? -Infinity);
-
-  for (const b of data.buckets) {
-    if (b.price + bucketSize / 2 < pMin || b.price - bucketSize / 2 > pMax) continue;
-
-    const yTop = state.candleSeries.coordinateToPrice ? state.candleSeries.priceToCoordinate?.(b.price + bucketSize / 2) : null;
-    const yBot = state.candleSeries.priceToCoordinate?.(b.price - bucketSize / 2);
-    const yCenter = state.candleSeries.priceToCoordinate?.(b.price);
-    if (yCenter == null || isNaN(yCenter)) continue;
-
-    let barH = (yBot != null && yTop != null && !isNaN(yTop) && !isNaN(yBot))
-      ? Math.max(1, Math.abs(yBot - yTop) - 1)
-      : 2;
-    barH = Math.min(barH, 30);
-
-    const total = b.long_usd + b.short_usd;
-    const intensity = total / data.max_usd;          // 0..1
-    const barW = Math.max(2, Math.floor(intensity * maxBarPx));
-
-    // Color by side dominance, with current price as the divider hint.
-    // Long liquidations are most relevant below price (teal).
-    // Short liquidations are most relevant above price (red).
-    const longDominant = b.long_usd >= b.short_usd;
-    const baseColor = longDominant ? [38, 166, 154] : [239, 83, 80];
-    const alpha = 0.18 + intensity * 0.55;           // 0.18..0.73
-
-    const x = w - barW - 2;
-    const y = Math.round(yCenter - barH / 2);
-
-    ctx.fillStyle = `rgba(${baseColor[0]}, ${baseColor[1]}, ${baseColor[2]}, ${alpha})`;
-    ctx.fillRect(x, y, barW, barH);
-
-    // Thin minority sliver in the opposite color, if both sides present
-    const minority = longDominant ? b.short_usd : b.long_usd;
-    if (minority > 0 && total > 0) {
-      const minColor = longDominant ? [239, 83, 80] : [38, 166, 154];
-      const minW = Math.max(1, Math.floor((minority / total) * barW));
-      ctx.fillStyle = `rgba(${minColor[0]}, ${minColor[1]}, ${minColor[2]}, ${alpha})`;
-      ctx.fillRect(x, y, minW, barH);
+    if (msg.event === 'result') {
+      document.getElementById('ai-running').hidden = true;
+      document.getElementById('ai-result').hidden  = false;
+      const r = msg.data || {};
+      document.getElementById('ai-candle').textContent     = r.next_candle  || '—';
+      document.getElementById('ai-direction').textContent  = r.direction    || '—';
+      document.getElementById('ai-confidence').textContent = r.confidence
+        ? r.confidence + '%' : '—';
+      document.getElementById('ai-factors').innerHTML =
+        (r.key_factors || []).map(f => `<li>${f}</li>`).join('');
+      document.getElementById('ai-reasoning').textContent = r.reasoning || '';
     }
-
-    // Bright leading edge for the bar (so cluster magnitude reads instantly)
-    ctx.fillStyle = `rgba(${baseColor[0]}, ${baseColor[1]}, ${baseColor[2]}, ${Math.min(1, alpha + 0.25)})`;
-    ctx.fillRect(x, y, 1, barH);
-  }
-
-  // Optional: dim cue line at the data window's right edge
-  if (lastClose != null) {
-    const ly = state.candleSeries.priceToCoordinate?.(lastClose);
-    if (ly != null && !isNaN(ly)) {
-      ctx.strokeStyle = "rgba(255,255,255,0.04)";
-      ctx.beginPath(); ctx.moveTo(0, ly); ctx.lineTo(w, ly); ctx.stroke();
+    if (msg.event === 'error') {
+      document.getElementById('ai-running').hidden = true;
+      document.getElementById('ai-result').hidden  = false;
+      const errEl = document.getElementById('ai-error');
+      if (errEl) { errEl.hidden = false; errEl.textContent = msg.message; }
     }
   }
 }
 
-function setLiqVisible(on) {
-  state.liqVisible = !!on;
-  localStorage.setItem("ix_liq_on", on ? "1" : "0");
-  const btn = $("liq-toggle");
-  if (btn) btn.setAttribute("aria-pressed", on ? "true" : "false");
-  const c = state.liqCanvas;
-  if (c) c.classList.toggle("hidden", !on);
-  if (!on) hideLiqTooltip();
-  if (on) {
-    if (!state.liqWs) connectLiquidations();
-    drawHeatmap();
-  }
+// ─── Formatters ───────────────────────────────────────────
+function fmt(v) {
+  const n = parseFloat(v);
+  if (isNaN(n)) return '—';
+  if (n >= 10000) return n.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+  if (n >= 100)   return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (n >= 1)     return n.toLocaleString('en-US', { minimumFractionDigits: 4, maximumFractionDigits: 4 });
+  return n.toLocaleString('en-US', { minimumFractionDigits: 6, maximumFractionDigits: 6 });
 }
 
-function connectLiquidations() {
-  if (state.liqWs) {
-    state.liqWs.onclose = null;
-    state.liqWs.close();
-  }
-  const url = `${WS_PROTO}://${BACKEND}/ws/liquidations?token=${encodeURIComponent(state.token)}${symParam()}`;
-  const ws = new WebSocket(url);
-  state.liqWs = ws;
-  ws.onmessage = (m) => {
-    const msg = JSON.parse(m.data);
-    if (msg.event === "snapshot") {
-      state.liqHeatmap = msg.data;
-      drawHeatmap();
-    }
-  };
-  ws.onclose = () => {
-    state.liqWs = null;
-    if (state.liqVisible) setTimeout(connectLiquidations, 5000);
-  };
-  ws.onerror = () => {};
+function fmtVol(v) {
+  const n = parseFloat(v);
+  if (isNaN(n)) return '—';
+  if (n >= 1e9) return (n/1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
+  return n.toFixed(2);
 }
-
-/* ============================================================
-   Paper trading
-   ============================================================ */
-
-function getPaperUid() {
-  let uid = localStorage.getItem("ix_paper_uid");
-  if (uid && uid.length >= 8) return uid;
-  // crypto.randomUUID() yields a 36-char dashed UUID — passes our regex.
-  uid = (crypto.randomUUID && crypto.randomUUID()) ||
-        (Date.now().toString(36) + Math.random().toString(36).slice(2, 14));
-  localStorage.setItem("ix_paper_uid", uid);
-  return uid;
-}
-
-const paper = {
-  uid: null,
-  ws: null,
-  side: "long",
-  size: 100,
-  leverage: 10,
-  account: null,         // last snapshot from server
-  history: [],           // closed trades (and open, but rendered separately)
-  lines: {},             // tradeId -> [entryLine, liqLine]
-  lastBalance: null,     // for color flash on change
-};
-
-function fmtUsdSigned(v) {
-  if (v == null || Number.isNaN(v)) return "—";
-  const s = v >= 0 ? "+" : "−";
-  return `${s}$${Math.abs(v).toFixed(2)}`;
-}
-function fmtUsd2(v) {
-  if (v == null || Number.isNaN(v)) return "—";
-  return `$${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-}
-function fmtPriceK(p) {
-  if (!p) return "—";
-  return `$${(p / 1000).toFixed(2)}k`;
-}
-
-function paperHeaders() {
-  return { "X-Auth-Token": state.token, "Content-Type": "application/json" };
-}
-
-async function paperPost(path, body) {
-  const r = await fetch(`${HTTP}://${BACKEND}${path}`, {
-    method: "POST",
-    headers: paperHeaders(),
-    body: JSON.stringify(body),
-    credentials: "omit",
-  });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.detail || `error ${r.status}`);
-  return data;
-}
-
-async function paperGet(path) {
-  const r = await fetch(`${HTTP}://${BACKEND}${path}`, {
-    headers: paperHeaders(), cache: "no-store", credentials: "omit",
-  });
-  if (!r.ok) throw new Error(`error ${r.status}`);
-  return r.json();
-}
-
-function setBalance(v) {
-  const el = $("balance");
-  if (!el) return;
-  el.textContent = fmtUsd2(v);
-  if (paper.lastBalance != null && Math.abs(v - paper.lastBalance) > 0.01) {
-    el.classList.remove("up", "down");
-    void el.offsetWidth;  // restart transition
-    el.classList.add(v >= paper.lastBalance ? "up" : "down");
-    setTimeout(() => el.classList.remove("up", "down"), 1500);
-  }
-  paper.lastBalance = v;
-}
-
-function liqPriceFor(side, mark, lev) {
-  const mm = 0.005;
-  if (!mark || !lev) return null;
-  return side === "long"
-    ? mark * (1 - 1 / lev + mm)
-    : mark * (1 + 1 / lev - mm);
-}
-
-function updateTradePreview() {
-  const size = Math.max(0, Number($("trade-size").value || 0));
-  const lev  = Number($("trade-leverage").value || 1);
-  // Mark = latest price on the price chart for the currently-displayed coin.
-  const mark = state.lastPrice || 0;
-  const margin = lev > 0 ? size / lev : 0;
-  $("lev-display").textContent = `${lev}x`;
-  $("trade-margin").textContent = fmtUsd2(margin);
-  $("trade-notional").textContent = fmtUsd2(size);
-  $("trade-mark").textContent = mark ? fmtUsd2(mark) : "—";
-  const liq = liqPriceFor(paper.side, mark, lev);
-  $("trade-liq").textContent = liq ? fmtUsd2(liq) : "—";
-  const btn = $("open-trade-btn");
-  btn.classList.toggle("short", paper.side === "short");
-  btn.textContent = `OPEN ${symLabel(state.symbol)} ${paper.side.toUpperCase()}`;
-}
-
-function setSide(side) {
-  paper.side = side;
-  document.querySelectorAll(".side-btn").forEach((b) => {
-    b.classList.toggle("active", b.dataset.side === side);
-  });
-  updateTradePreview();
-}
-
-/* ----- chart price lines per open trade ----- */
-
-function addTradeLines(t) {
-  if (!state.candleSeries) return;
-  if (paper.lines[t.id]) return;  // already drawn
-  const sideColor = t.side === "long" ? "#26a69a" : "#ef5350";
-  const entry = state.candleSeries.createPriceLine({
-    price: t.entry_price,
-    color: sideColor,
-    lineWidth: 2,
-    lineStyle: 0,
-    axisLabelVisible: true,
-    title: `${t.side === "long" ? "L" : "S"}${t.leverage}x #${t.id}`,
-  });
-  const liq = state.candleSeries.createPriceLine({
-    price: t.liq_price,
-    color: "#ef5350",
-    lineWidth: 1,
-    lineStyle: 2,    // dashed
-    axisLabelVisible: true,
-    title: `LIQ #${t.id}`,
-  });
-  paper.lines[t.id] = [entry, liq];
-}
-
-function removeTradeLines(tradeId) {
-  const lines = paper.lines[tradeId];
-  if (!lines || !state.candleSeries) return;
-  lines.forEach((l) => {
-    try { state.candleSeries.removePriceLine(l); } catch {}
-  });
-  delete paper.lines[tradeId];
-}
-
-function syncTradeLines(openTrades) {
-  // Only draw lines for trades on the currently-displayed symbol — a BTC
-  // trade's entry price means nothing on the ETH chart.
-  const onCurrent = openTrades.filter((t) => (t.symbol || "BTCUSDT").toUpperCase() === state.symbol);
-  const wanted = new Set(onCurrent.map((t) => t.id));
-  for (const id of Object.keys(paper.lines)) {
-    if (!wanted.has(Number(id))) removeTradeLines(Number(id));
-  }
-  for (const t of onCurrent) addTradeLines(t);
-}
-
-/* ----- rendering ----- */
-
-function applyPaperAccount(snap) {
-  if (!snap) return;
-  paper.account = snap;
-  setBalance(snap.balance);
-  // header badge for open count
-  const cnt = snap.open_trades?.length || 0;
-  const badge = $("open-pos-count");
-  if (badge) {
-    if (cnt > 0) { badge.hidden = false; badge.textContent = cnt; }
-    else { badge.hidden = true; }
-  }
-  // modal equity strip
-  $("modal-balance").textContent = fmtUsd2(snap.balance);
-  $("modal-equity").textContent  = fmtUsd2(snap.equity);
-  const unr = $("modal-unrealized");
-  unr.textContent = fmtUsdSigned(snap.unrealized);
-  unr.classList.toggle("up", snap.unrealized > 0);
-  unr.classList.toggle("down", snap.unrealized < 0);
-  // chart lines
-  syncTradeLines(snap.open_trades || []);
-  // active positions table
-  renderActiveTrades(snap.open_trades || []);
-  // refresh preview liq with fresh mark
-  updateTradePreview();
-  $("active-count").textContent = `(${cnt})`;
-}
-
-function symLabel(sym) {
-  return SYMBOL_LABEL[(sym || "").toUpperCase()] || (sym || "").replace(/USDT$/, "");
-}
-
-function renderActiveTrades(opens) {
-  const wrap = $("active-trades");
-  if (!wrap) return;
-  wrap.innerHTML = "";
-  for (const t of opens) {
-    const row = document.createElement("div");
-    row.className = "trade-row";
-    const pnlCls = t.unrealized_pnl >= 0 ? "up" : "down";
-    const pnlPct = (t.unrealized_pnl / t.size_usd) * 100;
-    const sym = symLabel(t.symbol);
-    row.innerHTML = `
-      <div class="col-side ${t.side}">${sym} ${t.side.toUpperCase()}</div>
-      <div class="col-lev">${t.leverage}x</div>
-      <div>${fmtUsd2(t.entry_price)}</div>
-      <div class="col-pnl ${pnlCls}">${fmtUsdSigned(t.unrealized_pnl)} <span class="col-lev">(${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%)</span></div>
-      <div class="col-meta">
-        <span>size ${fmtUsd2(t.size_usd)}</span>
-        <span>margin ${fmtUsd2(t.margin)}</span>
-        <span>liq ${fmtUsd2(t.liq_price)}</span>
-      </div>
-      <button class="close-btn" data-close="${t.id}">close</button>
-    `;
-    wrap.appendChild(row);
-  }
-  wrap.querySelectorAll("[data-close]").forEach((b) => {
-    b.onclick = () => closeTrade(Number(b.dataset.close));
-  });
-}
-
-function renderHistory(trades) {
-  const wrap = $("trade-history");
-  if (!wrap) return;
-  // Only show closed/liquidated/cancelled
-  const past = trades.filter((t) => t.status !== "open").slice(0, 50);
-  wrap.innerHTML = "";
-  for (const t of past) {
-    const row = document.createElement("div");
-    row.className = "trade-row compact";
-    const pnlCls = (t.pnl_usd || 0) >= 0 ? "up" : "down";
-    const date = t.close_ts ? new Date(t.close_ts).toLocaleString() : "—";
-    const sym = symLabel(t.symbol);
-    row.innerHTML = `
-      <div class="col-side ${t.side}">${sym} ${t.side.toUpperCase()}</div>
-      <div class="col-lev">${t.leverage}x</div>
-      <div>${fmtUsd2(t.entry_price)} → ${t.close_price ? fmtUsd2(t.close_price) : "—"}</div>
-      <div class="col-pnl ${pnlCls}">${fmtUsdSigned(t.pnl_usd)}</div>
-      <div class="col-meta">
-        <span>size ${fmtUsd2(t.size_usd)}</span>
-        <span>${date}</span>
-      </div>
-      <div class="col-status ${t.status}">${t.status}</div>
-    `;
-    wrap.appendChild(row);
-  }
-}
-
-/* ----- actions ----- */
-
-function clearTradeError() { $("trade-error").textContent = ""; }
-function showTradeError(msg) { $("trade-error").textContent = msg; }
-
-async function openTrade() {
-  clearTradeError();
-  const size = Number($("trade-size").value || 0);
-  const lev  = Number($("trade-leverage").value || 1);
-  if (size < 1) return showTradeError("size must be ≥ $1");
-  const btn = $("open-trade-btn");
-  btn.disabled = true;
-  try {
-    const res = await paperPost("/api/paper/open", {
-      uid: paper.uid,
-      symbol: state.symbol,
-      side: paper.side,
-      size_usd: size,
-      leverage: lev,
-    });
-    applyPaperAccount(res.account);
-    await refreshHistory();
-  } catch (e) {
-    showTradeError(e.message || "failed to open");
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-async function closeTrade(tradeId) {
-  try {
-    const res = await paperPost("/api/paper/close", {
-      uid: paper.uid, trade_id: tradeId,
-    });
-    applyPaperAccount(res.account);
-    await refreshHistory();
-  } catch (e) {
-    showTradeError(e.message || "failed to close");
-  }
-}
-
-async function resetAccount() {
-  if (!confirm("Reset account to $1000? All open positions will be cancelled.")) return;
-  try {
-    const res = await paperPost("/api/paper/reset", { uid: paper.uid });
-    applyPaperAccount(res.account);
-    await refreshHistory();
-  } catch (e) {
-    showTradeError(e.message || "failed to reset");
-  }
-}
-
-async function refreshHistory() {
-  try {
-    const res = await paperGet(`/api/paper/trades?uid=${encodeURIComponent(paper.uid)}&limit=100`);
-    paper.history = res.trades || [];
-    renderHistory(paper.history);
-  } catch {}
-}
-
-/* ----- modal control ----- */
-
-function openTradesModal() {
-  $("trades-modal").hidden = false;
-  refreshHistory();
-}
-function closeTradesModal() {
-  $("trades-modal").hidden = true;
-}
-
-/* ----- WS ----- */
-
-function connectPaperWs() {
-  if (paper.ws) {
-    paper.ws.onclose = null;
-    paper.ws.close();
-  }
-  const url = `${WS_PROTO}://${BACKEND}/ws/paper?token=${encodeURIComponent(state.token)}&uid=${encodeURIComponent(paper.uid)}`;
-  const ws = new WebSocket(url);
-  paper.ws = ws;
-  ws.onmessage = (m) => {
-    let msg;
-    try { msg = JSON.parse(m.data); } catch { return; }
-    if (msg.event === "snapshot" || msg.event === "tick") {
-      applyPaperAccount(msg.data);
-    } else if (msg.event === "liquidated") {
-      // Force a fresh history pull so the row appears in the closed list,
-      // and let the next snapshot strip the lines via syncTradeLines.
-      refreshHistory();
-    }
-  };
-  ws.onclose = () => setTimeout(connectPaperWs, 2000);
-}
-
-function initPaperUi() {
-  paper.uid = getPaperUid();
-
-  // Header button
-  $("my-trades-btn").onclick = openTradesModal;
-
-  // Modal close handlers
-  document.querySelectorAll("#trades-modal [data-close]").forEach((el) => {
-    el.onclick = closeTradesModal;
-  });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !$("trades-modal").hidden) closeTradesModal();
-  });
-
-  // Side toggle
-  document.querySelectorAll(".side-btn").forEach((b) => {
-    b.onclick = () => setSide(b.dataset.side);
-  });
-
-  // Form inputs
-  $("trade-size").oninput = updateTradePreview;
-  $("trade-leverage").oninput = updateTradePreview;
-  $("open-trade-btn").onclick = openTrade;
-  $("reset-account").onclick = resetAccount;
-
-  // Initial preview render
-  updateTradePreview();
-}
-
-/* ============================================================
-   Iceberg / whale absorption — horizontal lines on price chart
-   ============================================================ */
-
-function fmtUsdShort(v) {
-  if (v == null || Number.isNaN(v)) return "—";
-  const a = Math.abs(v);
-  if (a >= 1e9) return `$${(v/1e9).toFixed(2)}B`;
-  if (a >= 1e6) return `$${(v/1e6).toFixed(2)}M`;
-  if (a >= 1e3) return `$${(v/1e3).toFixed(1)}K`;
-  return `$${v.toFixed(0)}`;
-}
-
-function clearIcebergLines() {
-  if (!state.icebergLines || !state.candleSeries) return;
-  for (const line of state.icebergLines) {
-    try { state.candleSeries.removePriceLine(line); } catch {}
-  }
-  state.icebergLines = [];
-}
-
-function applyIcebergSnapshot(data) {
-  if (!data || !state.candleSeries) return;
-  clearIcebergLines();
-  const list = data.icebergs || [];
-  for (const ice of list) {
-    const color =
-      ice.side === "bid" ? "rgba(38,166,154,0.85)" :
-      ice.side === "ask" ? "rgba(239,83,80,0.85)" :
-                            "rgba(245,185,66,0.85)";
-    const line = state.candleSeries.createPriceLine({
-      price: ice.price,
-      color: color,
-      lineWidth: 2,
-      lineStyle: 1,    // dotted
-      axisLabelVisible: true,
-      title: `🐋 ${fmtUsdShort(ice.absorbed_usd)} · ${ice.ratio.toFixed(0)}x`,
-    });
-    state.icebergLines.push(line);
-  }
-}
-
-function connectIceberg() {
-  if (state.icebergWs) {
-    state.icebergWs.onclose = null;
-    state.icebergWs.close();
-  }
-  const url = `${WS_PROTO}://${BACKEND}/ws/iceberg?token=${encodeURIComponent(state.token)}${symParam()}`;
-  const ws = new WebSocket(url);
-  state.icebergWs = ws;
-  ws.onmessage = (m) => {
-    let msg;
-    try { msg = JSON.parse(m.data); } catch { return; }
-    if (msg.event === "snapshot") applyIcebergSnapshot(msg.data);
-  };
-  ws.onclose = () => setTimeout(connectIceberg, 3000);
-}
-
-/* ============================================================
-   Anchored CVD — shift+click on price chart drops anchor
-   ============================================================ */
-
-function findCvdAtTime(time) {
-  // Binary search the mirrored cvdData for the value at-or-just-before `time`.
-  const arr = state.cvdData;
-  if (!arr || !arr.length) return null;
-  let lo = 0, hi = arr.length - 1, best = null;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    if (arr[mid].time <= time) { best = arr[mid]; lo = mid + 1; }
-    else hi = mid - 1;
-  }
-  return best ? best.value : null;
-}
-
-function ensureAnchoredCvdSeries() {
-  if (state.anchoredCvdSeries || !state.cvdChart) return;
-  state.anchoredCvdSeries = state.cvdChart.addLineSeries({
-    color: "#c97cf4",
-    lineWidth: 2,
-    priceLineVisible: false,
-    lastValueVisible: true,
-    crosshairMarkerVisible: true,
-    title: "anchored",
-  });
-}
-
-function refreshAnchoredCvd() {
-  if (!state.anchor) return;
-  ensureAnchoredCvdSeries();
-  const baseline = findCvdAtTime(state.anchor.time);
-  if (baseline === null) return;
-  state.anchor.cvd_value = baseline;
-  const data = state.cvdData
-    .filter((p) => p.time >= state.anchor.time)
-    .map((p) => ({ time: p.time, value: p.value - baseline }));
-  state.anchoredCvdSeries.setData(data);
-}
-
-function updateAnchoredCvdLatest() {
-  if (!state.anchor || !state.anchoredCvdSeries) return;
-  const last = state.cvdData[state.cvdData.length - 1];
-  if (!last || last.time < state.anchor.time) return;
-  state.anchoredCvdSeries.update({
-    time: last.time,
-    value: last.value - (state.anchor.cvd_value || 0),
-  });
-}
-
-function setAnchor(time, price) {
-  clearAnchor();
-  state.anchor = { time, price, cvd_value: 0 };
-  // Vertical reference line on price chart
-  state.anchorPriceMarker = state.candleSeries.createPriceLine({
-    price: price,
-    color: "#c97cf4",
-    lineWidth: 1,
-    lineStyle: 2,    // dashed
-    axisLabelVisible: true,
-    title: `⚓ ${fmtUsd2(price)}`,
-  });
-  refreshAnchoredCvd();
-}
-
-function clearAnchor() {
-  if (state.anchorPriceMarker && state.candleSeries) {
-    try { state.candleSeries.removePriceLine(state.anchorPriceMarker); } catch {}
-  }
-  state.anchorPriceMarker = null;
-  if (state.anchoredCvdSeries && state.cvdChart) {
-    try { state.cvdChart.removeSeries(state.anchoredCvdSeries); } catch {}
-  }
-  state.anchoredCvdSeries = null;
-  state.anchor = null;
-}
-
-function attachAnchorHandler() {
-  // Alt+click drops an anchor (Shift is taken by the measure tool).
-  // Alt+click on/near an existing anchor removes it.
-  const pane = $("price");
-  // Visual cue when alt is held over the chart.
-  document.addEventListener("keydown", (e) => {
-    if (e.altKey) pane.classList.add("alt-hover");
-  });
-  document.addEventListener("keyup", () => pane.classList.remove("alt-hover"));
-  document.addEventListener("blur", () => pane.classList.remove("alt-hover"));
-
-  pane.addEventListener("click", (e) => {
-    if (!e.altKey) return;
-    if (!state.candleSeries || !state.priceChart) return;
-    const rect = pane.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    const time = state.priceChart.timeScale().coordinateToTime(x);
-    const price = state.candleSeries.coordinateToPrice(y);
-    if (time == null || price == null) return;
-    if (state.anchor && Math.abs(state.anchor.time - time) < 60) {
-      clearAnchor();
-      return;
-    }
-    setAnchor(time, price);
-  });
-  // Crosshair hint when alt is held
-  pane.addEventListener("keydown", () => {});  // no-op; CSS handled below
-}
-
-/* ============================================================
-   AI analysis
-   ============================================================ */
-
-const ai = {
-  ws: null,
-  running: false,
-  buffer: "",
-};
-
-const AI_PHASE_ORDER = ["reading", "context", "metrics", "connecting", "thinking", "synthesizing", "complete"];
-
-function aiSetPhase(phase) {
-  const phases = document.querySelectorAll("#ai-phases li");
-  const idx = AI_PHASE_ORDER.indexOf(phase);
-  phases.forEach((li) => {
-    const i = AI_PHASE_ORDER.indexOf(li.dataset.phase);
-    li.classList.remove("active", "done");
-    if (i < idx) li.classList.add("done");
-    else if (i === idx) li.classList.add("active");
-  });
-}
-
-function aiResetUi() {
-  $("ai-symbol-display").textContent = symLabel(state.symbol);
-  $("ai-intro").hidden = false;
-  $("ai-running").hidden = true;
-  $("ai-result").hidden = true;
-  $("ai-stream").textContent = "";
-  $("ai-answer").textContent = "";
-  $("ai-answer-head").hidden = true;
-  $("ai-status").textContent = "initializing…";
-  $("ai-error").hidden = true;
-  $("ai-error").textContent = "";
-  document.querySelectorAll("#ai-phases li").forEach((li) => li.classList.remove("active", "done"));
-  ai.buffer = "";
-  ai.answerBuffer = "";
-}
-
-function aiShowRunning() {
-  $("ai-intro").hidden = true;
-  $("ai-running").hidden = false;
-  $("ai-result").hidden = true;
-}
-
-function aiShowResult(verdict) {
-  $("ai-running").hidden = true;
-  $("ai-result").hidden = false;
-
-  // next candle card
-  const candle = String(verdict.next_candle || "").toLowerCase();
-  const candleEl = $("ai-card-candle");
-  candleEl.classList.remove("green", "red");
-  if (candle === "green" || candle === "red") candleEl.classList.add(candle);
-  $("ai-candle").textContent = candle.toUpperCase() || "—";
-
-  // direction card
-  const dir = String(verdict.direction || "").toLowerCase();
-  const dirEl = $("ai-card-direction");
-  dirEl.classList.remove("bullish", "bearish", "ranging");
-  if (["bullish", "bearish", "ranging"].includes(dir)) dirEl.classList.add(dir);
-  $("ai-direction").textContent = dir.toUpperCase() || "—";
-
-  // confidence
-  const conf = Number(verdict.confidence_pct || 0);
-  $("ai-confidence").textContent = `${conf.toFixed(0)}%`;
-
-  // factors
-  const factorsEl = $("ai-factors");
-  factorsEl.innerHTML = "";
-  (verdict.key_factors || []).forEach((f) => {
-    const li = document.createElement("li");
-    li.textContent = String(f);
-    factorsEl.appendChild(li);
-  });
-
-  // reasoning
-  $("ai-reasoning").textContent = verdict.reasoning_summary || "—";
-}
-
-function aiShowError(msg) {
-  // Either inline in result view (if reached), or as overlay on running
-  $("ai-error").textContent = msg;
-  $("ai-error").hidden = false;
-  // Make sure something is visible
-  if ($("ai-running").hidden && $("ai-result").hidden) {
-    $("ai-result").hidden = false;
-  }
-}
-
-function aiHandleEvent(msg) {
-  if (msg.event === "status") {
-    $("ai-status").textContent = msg.text || msg.phase || "…";
-    if (msg.phase) aiSetPhase(msg.phase);
-  } else if (msg.event === "reasoning") {
-    // Chain-of-thought tokens — shown in the top "thinking" pane (muted)
-    ai.buffer += msg.text || "";
-    const stream = $("ai-stream");
-    stream.textContent = ai.buffer;
-    stream.scrollTop = stream.scrollHeight;
-  } else if (msg.event === "chunk") {
-    // Final answer tokens — shown in the bottom "analysis" pane (bright)
-    if (!ai.answerBuffer) {
-      $("ai-answer-head").hidden = false;
-    }
-    ai.answerBuffer = (ai.answerBuffer || "") + (msg.text || "");
-    const answer = $("ai-answer");
-    answer.textContent = ai.answerBuffer;
-    answer.scrollTop = answer.scrollHeight;
-  } else if (msg.event === "verdict") {
-    aiShowResult(msg.data || {});
-  } else if (msg.event === "error") {
-    aiShowError(msg.message || "AI request failed");
-  } else if (msg.event === "done") {
-    ai.running = false;
-    $("ai-btn").classList.remove("running");
-  } else if (msg.event === "ping") {
-    // keepalive — ignore
-  }
-}
-
-function aiRun() {
-  if (ai.running) return;
-  ai.running = true;
-  ai.buffer = "";
-  $("ai-btn").classList.add("running");
-  $("ai-symbol-display").textContent = symLabel(state.symbol);
-  aiShowRunning();
-  $("ai-status").textContent = "opening connection…";
-
-  if (ai.ws) {
-    try { ai.ws.close(); } catch {}
-    ai.ws = null;
-  }
-  const url = `${WS_PROTO}://${BACKEND}/ws/ai-analysis?token=${encodeURIComponent(state.token)}${symParam()}`;
-  const ws = new WebSocket(url);
-  ai.ws = ws;
-  ws.onopen = () => {
-    ws.send(JSON.stringify({ action: "start" }));
-  };
-  ws.onmessage = (m) => {
-    let msg;
-    try { msg = JSON.parse(m.data); } catch { return; }
-    aiHandleEvent(msg);
-  };
-  ws.onclose = () => {
-    ai.running = false;
-    $("ai-btn").classList.remove("running");
-    if (ai.ws === ws) ai.ws = null;
-  };
-  ws.onerror = () => {
-    aiShowError("WebSocket error — check that the backend is reachable.");
-    ai.running = false;
-    $("ai-btn").classList.remove("running");
-  };
-}
-
-function openAiModal() {
-  aiResetUi();
-  $("ai-modal").hidden = false;
-}
-function closeAiModal() {
-  // If a run is in progress, close the WS so we don't leak it.
-  if (ai.ws) {
-    try { ai.ws.close(); } catch {}
-    ai.ws = null;
-  }
-  ai.running = false;
-  $("ai-btn").classList.remove("running");
-  $("ai-modal").hidden = true;
-}
-
-function initAiUi() {
-  $("ai-btn").onclick = openAiModal;
-  $("ai-run-btn").onclick = aiRun;
-  $("ai-rerun-btn").onclick = () => { aiResetUi(); aiRun(); };
-  document.querySelectorAll("#ai-modal [data-close]").forEach((el) => {
-    el.onclick = closeAiModal;
-  });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !$("ai-modal").hidden) closeAiModal();
-  });
-}
-
-async function init() {
-  state.token = await ensureAuth();
-  document.querySelector("header").style.display = "";
-  document.querySelector("main").style.display = "";
-  $("logout").onclick = logout;
-  state.liqVisible = localStorage.getItem("ix_liq_on") === "1";
-  buildCharts();
-  $("liq-toggle").setAttribute("aria-pressed", state.liqVisible ? "true" : "false");
-  $("liq-toggle").onclick = () => setLiqVisible(!state.liqVisible);
-  const r = await fetch(`${HTTP}://${BACKEND}/api/symbols`, {
-    headers: { "X-Auth-Token": state.token },
-    cache: "no-store",
-    credentials: "omit",
-  }).then((x) => x.json());
-
-  state.capabilities = r.capabilities || {};
-
-  // The dropdown is gone — search bar handles arbitrary tokens. The persisted
-  // symbol just needs to be SOMETHING (no validation against the warm list,
-  // since search supports any Binance perp). If nothing stored, use default.
-  if (!state.symbol) {
-    state.symbol = r.default || "BTCUSDT";
-    localStorage.setItem("ix_symbol", state.symbol);
-  }
-
-  initSymbolSearch();
-
-  const tfs = $("tfs");
-  tfs.innerHTML = "";
-  r.timeframes.forEach((tf) => {
-    const b = document.createElement("button");
-    b.textContent = tf;
-    if (tf === state.timeframe) b.classList.add("active");
-    b.onclick = () => {
-      state.timeframe = tf;
-      localStorage.setItem("ix_timeframe", tf);
-      [...tfs.children].forEach((c) => c.classList.toggle("active", c.textContent === tf));
-      connect();   // timeframe only affects the price/CVD WS
-    };
-    tfs.appendChild(b);
-  });
-
-  applyCapabilities();
-  reconnectAllForSymbol();
-
-  initPaperUi();
-  connectPaperWs();
-  initAiUi();
-  attachAnchorHandler();
-
-  // Token meta strip — load now and refresh every 8s.
-  loadTokenMeta(state.symbol);
-  startTokenMetaRefresh();
-}
-
-init();
-
-/* ---------- Measure tool (Shift+drag on price pane) ---------- */
-(function attachMeasure() {
-  const pane = document.getElementById("price");
-
-  const hint = document.createElement("div");
-  hint.className = "hint";
-  hint.textContent = "shift + drag to measure";
-  pane.appendChild(hint);
-
-  let active = false;
-  let start = null;       // { x, y, price, time }
-  let box = null;
-  let label = null;
-
-  const tfMs = () => ({ "1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000 }[state.timeframe] || 60_000);
-
-  function clear() {
-    if (box) box.remove();
-    if (label) label.remove();
-    box = label = null;
-    active = false;
-    start = null;
-  }
-
-  function pointFromEvent(e) {
-    const rect = pane.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    const price = state.candleSeries.coordinateToPrice(y);
-    const time = state.priceChart.timeScale().coordinateToTime(x);
-    return { x, y, price, time };
-  }
-
-  function fmtNum(n, d = 2) {
-    return Number(n).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
-  }
-
-  function fmtDuration(ms) {
-    const s = Math.abs(Math.round(ms / 1000));
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const sec = s % 60;
-    if (h > 0) return `${h}h ${m}m`;
-    if (m > 0) return `${m}m ${sec}s`;
-    return `${sec}s`;
-  }
-
-  function render(end) {
-    if (!start) return;
-    const x1 = Math.min(start.x, end.x);
-    const x2 = Math.max(start.x, end.x);
-    const y1 = Math.min(start.y, end.y);
-    const y2 = Math.max(start.y, end.y);
-    const w = x2 - x1;
-    const h = y2 - y1;
-
-    const dPrice = end.price - start.price;
-    const pct = (dPrice / start.price) * 100;
-    const up = dPrice >= 0;
-
-    if (!box) {
-      box = document.createElement("div");
-      box.className = "measure-box";
-      pane.appendChild(box);
-    }
-    box.className = "measure-box " + (up ? "up" : "down");
-    box.style.left = x1 + "px";
-    box.style.top = y1 + "px";
-    box.style.width = w + "px";
-    box.style.height = h + "px";
-
-    if (!label) {
-      label = document.createElement("div");
-      label.className = "measure-label";
-      pane.appendChild(label);
-    }
-
-    let bars = "—", duration = "—";
-    if (typeof start.time === "number" && typeof end.time === "number") {
-      const ms = (end.time - start.time) * 1000;
-      bars = Math.round(Math.abs(ms) / tfMs());
-      duration = fmtDuration(ms);
-    }
-
-    const sign = up ? "+" : "−";
-    const cls = up ? "pos" : "neg";
-    label.innerHTML = `
-      <div class="row"><span class="lbl">Δ</span><span class="${cls}">${sign}${fmtNum(Math.abs(dPrice))}  (${sign}${fmtNum(Math.abs(pct))}%)</span></div>
-      <div class="row"><span class="lbl">bars</span><span>${bars}</span><span class="lbl">time</span><span>${duration}</span></div>
-      <div class="row"><span class="lbl">from</span><span>${fmtNum(start.price)}</span><span class="lbl">to</span><span>${fmtNum(end.price)}</span></div>
-    `;
-
-    // Position label near the end point, clamped to pane
-    const paneRect = pane.getBoundingClientRect();
-    let lx = end.x + 12;
-    let ly = end.y + 12;
-    label.style.left = "0px"; label.style.top = "0px";
-    const lw = label.offsetWidth, lh = label.offsetHeight;
-    if (lx + lw > paneRect.width - 4) lx = end.x - lw - 12;
-    if (ly + lh > paneRect.height - 4) ly = end.y - lh - 12;
-    if (lx < 4) lx = 4;
-    if (ly < 4) ly = 4;
-    label.style.left = lx + "px";
-    label.style.top = ly + "px";
-  }
-
-  pane.addEventListener("mousedown", (e) => {
-    if (!e.shiftKey || e.button !== 0) return;
-    e.preventDefault();
-    clear();
-    active = true;
-    start = pointFromEvent(e);
-    state.priceChart.applyOptions({ handleScroll: false, handleScale: false });
-  });
-
-  window.addEventListener("mousemove", (e) => {
-    if (!active) return;
-    render(pointFromEvent(e));
-  });
-
-  window.addEventListener("mouseup", () => {
-    if (!active) return;
-    active = false;
-    state.priceChart.applyOptions({ handleScroll: true, handleScale: true });
-  });
-
-  window.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") clear();
-  });
-})();
