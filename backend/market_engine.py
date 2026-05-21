@@ -241,7 +241,10 @@ class MarketEngine:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.get(url, params=params)
                 r.raise_for_status()
-                return r.json().get("data", [])
+                data = r.json().get("data", [])
+                # Bitunix returns newest-first; sort ascending for correct deque ordering
+                data.sort(key=lambda x: int(x.get("time", 0)))
+                return data
         except Exception as e:
             print(f"[market-engine] kline fetch {self.symbol}/{tf} failed: {e}")
             return []

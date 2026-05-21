@@ -213,8 +213,8 @@ header {
   font-size: 11px;
 }
 
-.token-change.pos { color: var(--up); }
-.token-change.neg { color: var(--down); }
+.token-change.pos, .token-change.up   { color: var(--up); }
+.token-change.neg, .token-change.down { color: var(--down); }
 
 .token-volume { color: var(--fg-2); }
 .token-volume .lbl { color: var(--mute); margin-right: 4px; }
@@ -251,8 +251,10 @@ header {
   text-transform: uppercase;
 }
 
-.status.connected { color: var(--up); }
-.status.error     { color: var(--down); }
+.status.connected, .status-live        { color: var(--up); }
+.status.error, .status-error           { color: var(--down); }
+.status-connecting                     { color: var(--warn); }
+.status-disconnected                   { color: var(--mute); }
 
 /* header right section */
 .header-mid { margin-left: auto; }
