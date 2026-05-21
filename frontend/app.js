@@ -199,12 +199,9 @@ function buildChart() {
     _raf = requestAnimationFrame(() => { _raf = null; drawICT(); });
   }
 
-  // Horizontal zoom / scroll
+  // Redraw on horizontal zoom/scroll, vertical range change, and crosshair
   chart.timeScale().subscribeVisibleLogicalRangeChange(scheduleDrawICT);
-  // Vertical zoom (price scale drag)
-  chart.priceScale('right').applyOptions({});   // ensure scale exists
   chart.timeScale().subscribeVisibleTimeRangeChange(scheduleDrawICT);
-  // Crosshair moves (live cursor tracking)
   chart.subscribeCrosshairMove(scheduleDrawICT);
 
   const ro = new ResizeObserver(() => {
