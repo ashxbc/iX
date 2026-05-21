@@ -11,6 +11,7 @@ result is broadcast to all connected clients for that (symbol, timeframe).
 """
 import asyncio
 import json
+import math
 import os
 import secrets
 from contextlib import asynccontextmanager
@@ -52,6 +53,26 @@ WARM_SYMBOLS   = ["BTCUSDT", "ETHUSDT"]
 TIMEFRAMES     = list(TIMEFRAME_MS.keys())
 WS_KEEPALIVE   = 25.0
 _WS_PING       = json.dumps({"event": "ping"})
+
+
+# ---------------------------------------------------------------------------
+# JSON helpers
+# ---------------------------------------------------------------------------
+
+def _safe_json(obj) -> str:
+    """json.dumps that replaces NaN/Inf with null instead of raising."""
+    return json.dumps(obj, allow_nan=False)
+
+
+def _sanitize(obj):
+    """Recursively replace float NaN/Inf with None so json.dumps won't crash."""
+    if isinstance(obj, float):
+        return None if (math.isnan(obj) or math.isinf(obj)) else obj
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize(v) for v in obj]
+    return obj
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +154,11 @@ def _run_ict(app: FastAPI, sym: str, tf: str) -> dict:
     if eng is None:
         return ict_engine._empty()
     candles = eng.snapshot(tf)
-    return ict_engine.analyze(candles, tf)
+    try:
+        return ict_engine.analyze(candles, tf)
+    except Exception as e:
+        print(f"[ict] {sym}/{tf} analysis error: {e}")
+        return ict_engine._empty()
 
 
 def _run_signals(app: FastAPI, sym: str, tf: str) -> list[dict]:
@@ -404,7 +429,7 @@ async def candle_feed(
                     if sym in app.state.funding else None)
         sigs     = signal_engine.generate_signals(ict_data, fnd_snap)
 
-        await ws.send_text(json.dumps({
+        await ws.send_text(_safe_json(_sanitize({
             "event": "snapshot",
             "data":  {
                 "candles":   snap,
@@ -412,7 +437,7 @@ async def candle_feed(
                 "signals":   sigs,
                 "timeframes": TIMEFRAMES,
             },
-        }))
+        })))
 
         # Pump loop with keepalive
         while True:
@@ -421,7 +446,7 @@ async def candle_feed(
             except asyncio.TimeoutError:
                 await ws.send_text(_WS_PING)
                 continue
-            await ws.send_text(json.dumps(msg))
+            await ws.send_text(_safe_json(_sanitize(msg)))
 
     except WebSocketDisconnect:
         pass

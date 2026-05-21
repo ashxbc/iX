@@ -222,6 +222,20 @@ class MarketEngine:
             for c in reversed(pad):
                 self.candles[tf].appendleft(c)
 
+        # 4. Fallback: if still empty after all steps, grab 200 most recent unconditionally
+        if not self.candles[tf]:
+            fallback = await self._fetch_klines(tf, limit=200)
+            for k in fallback:
+                t = int(k["time"])
+                nc = Candle(t, float(k["open"]), observed=False)
+                nc.apply_kline(float(k["open"]), float(k["high"]),
+                               float(k["low"]),  float(k["close"]),
+                               float(k.get("baseVol", 0) or 0))
+                self.candles[tf].append(nc)
+            if self.candles[tf]:
+                print(f"[market-engine] {self.symbol}/{tf} used fallback seed "
+                      f"({len(self.candles[tf])} candles)")
+
         # Set current bucket tracker
         if self.candles[tf]:
             self._bucket_now[tf] = self._bucket(self.candles[tf][-1].ts, tf)
