@@ -191,8 +191,21 @@ function buildChart() {
   container.appendChild(overlayCanvas);
   syncCanvas();
 
-  chart.timeScale().subscribeVisibleLogicalRangeChange(() => drawICT());
-  chart.subscribeCrosshairMove(() => drawICT());
+  // Use rAF so the canvas always draws *after* LightweightCharts
+  // finishes updating its own coordinate system for that frame.
+  let _raf = null;
+  function scheduleDrawICT() {
+    if (_raf) cancelAnimationFrame(_raf);
+    _raf = requestAnimationFrame(() => { _raf = null; drawICT(); });
+  }
+
+  // Horizontal zoom / scroll
+  chart.timeScale().subscribeVisibleLogicalRangeChange(scheduleDrawICT);
+  // Vertical zoom (price scale drag)
+  chart.priceScale('right').applyOptions({});   // ensure scale exists
+  chart.timeScale().subscribeVisibleTimeRangeChange(scheduleDrawICT);
+  // Crosshair moves (live cursor tracking)
+  chart.subscribeCrosshairMove(scheduleDrawICT);
 
   const ro = new ResizeObserver(() => {
     chart.applyOptions({
@@ -200,7 +213,7 @@ function buildChart() {
       height: container.clientHeight,
     });
     syncCanvas();
-    drawICT();
+    scheduleDrawICT();
   });
   ro.observe(container);
 }
@@ -364,7 +377,7 @@ function handleCandleMessage(msg) {
   const { event, data } = msg;
   if (event === 'snapshot') { loadSnapshot(data); return; }
   if (event === 'tick' || event === 'candle') { updateCandle(data); return; }
-  if (event === 'ict')     { currentICT = data; drawICT(); return; }
+  if (event === 'ict')     { currentICT = data; requestAnimationFrame(drawICT); return; }
   if (event === 'signals') {
     currentSignals = Array.isArray(data) ? data : [];
     renderSignals();
@@ -385,7 +398,7 @@ function loadSnapshot(data) {
     chart.timeScale().fitContent();
     pxEl.textContent = fmt(candles[candles.length - 1].close);
   }
-  if (data.ict)     { currentICT     = data.ict;    drawICT(); }
+  if (data.ict)     { currentICT     = data.ict;    requestAnimationFrame(drawICT); }
   if (data.signals) { currentSignals = data.signals; renderSignals(); }
 }
 
